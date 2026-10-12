@@ -17,24 +17,44 @@ nvidia-smi
 
 GPU 6 是物理编号；进程内唯一设备通常为逻辑 GPU 0。训练器检查单 JAX process、单可见 GPU，完全不启动 FSDP。JAX 与 simulator 使用两个 Python 环境，防止原仓库不同的 PyTorch/Transformers 版本互相覆盖。
 
-新 Linux 环境需要可用的 NVIDIA 驱动、Python 3.11、git、git-lfs、编译工具、ffmpeg 和 Vulkan runtime。Ubuntu/Debian 的系统软件示例：
+安装采用用户目录和仓库内的虚拟环境，**不需要 sudo**。服务器需要已有可用的 NVIDIA 驱动，以及能访问的 git 和网络。进入仓库后执行：
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git git-lfs curl build-essential ffmpeg libvulkan1 mesa-vulkan-drivers
-git lfs install
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"
 bash scripts/t2mem/setup_server.sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`setup_server.sh` 拒绝在 Mac 运行，初始化 simulator submodule，执行仓库的 `uv sync --group dev` 和 editable install。训练环境采用仓库已有版本（JAX CUDA12 0.5.3、Flax 0.10.2、Orbax 0.11.13）；它们还没有在目标服务器验证。无需为本实现安装 FlashAttention。过期的 `sandbox2/flash_attn_jax` workspace member 已移除，因为该目录不在 checkout 中。
+`setup_server.sh` 拒绝在 Mac 运行。若缺少 uv，使用官方 installer 将它安装到`$HOME/.local/bin`，不修改 shell profile；因此脚本运行后需要上述 PATH 命令。使用 curl 或 wget 下载 installer，无需先安装系统 Python。uv 选择 Python 3.11，缺少兼容解释器时按需下载到用户目录；已有集群 Python 可用`T2MEM_PYTHON=/path/to/python3.11 bash scripts/t2mem/setup_server.sh`指定。脚本初始化 simulator submodule，执行`uv sync --python 3.11 --group dev`和 editable install。参考[uv 安装](https://docs.astral.sh/uv/getting-started/installation/)及[Python 管理](https://docs.astral.sh/uv/guides/install-python/)。
+
+训练环境采用仓库已有版本（JAX CUDA12 0.5.3、Flax 0.10.2、Orbax 0.11.13）。`jax[cuda12]`通过 Python 包安装 CUDA/cuDNN 用户态依赖；此路径无需安装系统 CUDA Toolkit，但不能安装或替代服务器的 NVIDIA kernel driver。已有 driver 必须兼容 CUDA12，实际是否可用以之后的`jax.devices()`检查为准。不要因为`nvidia-smi`显示的 CUDA 版本就重新安装 Toolkit；该显示也不证明 Vulkan 可用。参考[JAX GPU 安装](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu)。这些依赖尚未在目标服务器验证。无需为本实现安装 FlashAttention。过期的`sandbox2/flash_attn_jax`workspace member已移除，因为该目录不在 checkout 中。
+
+PickXtimes 数据下载使用 Hugging Face HTTP API，π0.5-base 使用仓库的 GCS downloader，这两个命令不要求 git-lfs。若其他 checkout/submodule 报缺少 git-lfs，可从已有集群 module 或用户环境提供；不要执行需要系统权限的安装。若某个依赖需要从源码编译，编译器也应从集群 module 或用户环境提供。
 
 仓库的`.gitmodules`使用GitHub SSH URL，fresh server可能没有SSH key。setup先执行`git submodule init`，再把此checkout的`submodule.third_party/robomme_benchmark.url`设为公开HTTPS URL；不修改global Git配置或`.gitmodules`。
 
-模拟器环境 `.venv-robomme` 安装仓库要求的 ManiSkill fork `YinpeiDai/ManiSkill@dev`、moviepy、OpenCV、imageio，以及 editable RoboMME benchmark/client。T²Mem 的 evaluation 在原入口 `examples/robomme/eval.py --t2mem` 提前分流，不导入 oracle、Gemini、Qwen 或 subgoal predictor。原有基线的完整 simulator/VLM 安装说明仍见 `examples/robomme/readme.md` 和其 `requirements.txt`；运行旧外部 VLM baseline 时再安装那些额外依赖。本地 simulator submodule 为空，不能据此确认远端 benchmark 的全部安装及 Vulkan 条件。
+模拟器环境`.venv-robomme`安装 ManiSkill fork 的固定 commit`07be6fbc66350ddca200abfb0a11b692f078f7fd`，与当前 benchmark gitlink`856bc3a189d4172f3f47dbee4424d585f8d78db3`声明的来源一致。该 benchmark 要求`opencv-python>=4.11.0.86`，安装脚本使用4.11.0.86，修正原先4.10.0.84的冲突；benchmark还会安装其指定的PyTorch2.9.1/torchvision0.24.1，与policy环境分开。参考[固定 benchmark 的依赖声明](https://github.com/RoboMME/robomme_benchmark/blob/856bc3a189d4172f3f47dbee4424d585f8d78db3/pyproject.toml)。其CUDA wheel也依赖兼容的host driver，不能仅凭policy环境可用就认定simulator已可用。
 
-安装脚本在`runs/environment/`保存两个环境的`pip freeze`和policy/benchmark Git revisions，记录现有ManiSkill `dev`分支实际解析的版本；复现实验时应归档这些文件，避免后续branch变化混入环境差异。
+另外安装moviepy、imageio、imageio-ffmpeg以及editable benchmark/client。常见Linux平台的imageio-ffmpeg wheel自带ffmpeg binary，因此保存视频无需apt安装ffmpeg；已有用户binary也可用`IMAGEIO_FFMPEG_EXE=/path/to/ffmpeg`指定。`ffmpeg-python`本身不是ffmpeg binary。参考[imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)。默认evaluation不保存视频，但模型仍需要simulator渲染两路相机图像。
+
+T²Mem 的 evaluation 在原入口`examples/robomme/eval.py --t2mem`提前分流，不导入 oracle、Gemini、Qwen 或 subgoal predictor。原有基线的完整 simulator/VLM 安装说明仍见`examples/robomme/readme.md`和其`requirements.txt`；运行旧外部 VLM baseline 时再安装那些额外依赖。本地 simulator submodule 为空，不能据此确认远端 benchmark 的全部安装及 Vulkan 条件。
+
+无 sudo 的 Vulkan 排查：如果仅缺 loader/tools，且已有 conda，可在用户目录建独立环境：
+
+```bash
+conda create -y -p "$HOME/.local/share/t2mem/vulkan" -c conda-forge libvulkan-loader vulkan-tools
+conda run -p "$HOME/.local/share/t2mem/vulkan" vulkaninfo --summary
+```
+
+也可使用已有 mamba/micromamba 的等价命令。两个包来自 conda-forge 的[libvulkan-loader](https://anaconda.org/conda-forge/libvulkan-loader)和[vulkan-tools](https://anaconda.org/conda-forge/vulkan-tools)。如果需要让虚拟环境中的 simulator 使用该 loader，仅在 simulator 终端附加用户 library path：
+
+```bash
+LD_LIBRARY_PATH="$HOME/.local/share/t2mem/vulkan/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  bash scripts/t2mem/eval_pickxtimes.sh --save-dir runs/evaluation/pickxtimes_A
+```
+
+Vulkan loader 不等于 NVIDIA Vulkan ICD/graphics driver。`vulkaninfo`应能看到 NVIDIA GPU；只看到 CPU/Mesa 或仍报找不到 ICD 时，需要服务器已有的匹配 NVIDIA 渲染库和 manifest。已有正确 manifest 可通过`VK_DRIVER_FILES`（modern loader）或`VK_ICD_FILENAMES`（legacy loader）指向其路径。缺少`libGLX_nvidia.so.0`/`libEGL_nvidia.so.0`或 kernel driver 时，安装 loader、Mesa 或 Python 包不能代替匹配驱动，应使用集群提供的 driver/module 或联系管理员补齐。参考[ManiSkill Vulkan 要求](https://maniskill.readthedocs.io/en/latest/user_guide/getting_started/installation.html#vulkan)和[Khronos driver 查找规则](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md)。此用户环境方案未在目标 A100 验证。
+
+安装脚本在`runs/environment/`保存两个环境的`pip freeze`和policy/benchmark Git revisions；复现实验时应归档这些文件，记录固定ManiSkill commit及最终解析的Python包版本。
 
 服务器安装后检查：
 
