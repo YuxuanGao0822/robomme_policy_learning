@@ -79,3 +79,49 @@ class MMEVLAWebsocketClientPolicy(WebsocketClientPolicy):
         self._ws.send(data)
         response = self._ws.recv()
         return msgpack_numpy.unpackb(response)
+
+
+class T2MemWebsocketClientPolicy(WebsocketClientPolicy):
+    """Incremental T²Mem protocol; never resend a full execution history.
+
+    Each client connection can address several environments. Its active episode
+    keys are independent of all other connections, even when IDs coincide.
+    """
+
+    protocol = "t2mem.v1"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._server_metadata.get("protocol") != self.protocol:
+            self.close()
+            raise ValueError("The selected server does not support the incremental T²Mem protocol.")
+
+    def _request(self, op: str, env_id: str, task: str, episode_id: str, **payload) -> Dict:
+        control = payload.pop("control", {})
+        return super().infer({
+            "_t2mem": {
+                "protocol": self.protocol,
+                "op": op,
+                "env_id": env_id,
+                "task": task,
+                "episode_id": str(episode_id),
+                **control,
+            },
+            **payload,
+        })
+
+    def start_episode(self, *, env_id: str, task: str, episode_id: str, prompt: str, seed: int) -> Dict:
+        return self._request("start", env_id, task, episode_id, prompt=prompt, seed=seed)
+
+    def observe(self, *, env_id: str, task: str, episode_id: str, phase: str, frames: list[Dict]) -> Dict:
+        """Frames are {'index': physical_index, 'observation': raw_observation}."""
+        return self._request("observe", env_id, task, episode_id, control={"phase": phase}, frames=frames)
+
+    def infer_at(self, *, env_id: str, task: str, episode_id: str, index: int, observation: Dict) -> Dict:
+        return self._request("infer", env_id, task, episode_id, control={"index": index}, observation=observation)
+
+    def end_episode(self, *, env_id: str, task: str, episode_id: str) -> Dict:
+        return self._request("end", env_id, task, episode_id)
+
+    def close(self) -> None:
+        self._ws.close()

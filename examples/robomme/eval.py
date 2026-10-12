@@ -1,3 +1,16 @@
+import sys
+
+# T²Mem retains the existing benchmark entry point and EnvRunner, with a separate
+# incremental RPC loop: E32 needs an observation-only write at physical step16.
+# Dispatch before optional external VLM imports; A/B/C use no subgoal predictor.
+if __name__ == "__main__" and "--t2mem" in sys.argv:
+    from pathlib import Path as _T2Path
+    import runpy as _t2runpy
+
+    sys.argv.remove("--t2mem")
+    _t2runpy.run_path(str(_T2Path(__file__).resolve().parents[2] / "scripts" / "t2mem" / "eval.py"), run_name="__main__")
+    raise SystemExit(0)
+
 import dataclasses
 import json
 import os

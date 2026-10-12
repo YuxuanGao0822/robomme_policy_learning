@@ -77,7 +77,7 @@ lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
-members = ["packages/*", "sandbox2/flash_attn_jax"]
+members = ["packages/*"]
 
 [tool.ruff]
 line-length = 120

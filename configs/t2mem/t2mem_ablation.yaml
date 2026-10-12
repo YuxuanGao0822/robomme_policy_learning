@@ -1,0 +1,9 @@
+# Illustrative inference intervention only; do NOT retrain Experiment C.
+# Load Experiment B's exact checkpoint with serve.py --ablation no-online-write.
+# Serving resolves the saved model config, then overrides online_write=false.
+extends: t2mem_a100_80gb.yaml
+name: t2mem_ablation
+checkpoint_dir: runs/ckpts/t2mem_ablation
+model:
+  memory:
+    online_write: false

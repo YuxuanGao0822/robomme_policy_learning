@@ -1,0 +1,16 @@
+# APPROXIMATION: last 8 retained observations start from W0; this tests runtime
+# plumbing only and is not a scientific reproduction or a memory benchmark.
+extends: t2mem_a100_80gb.yaml
+name: t2mem_smoke
+checkpoint_dir: runs/ckpts/t2mem_smoke
+data:
+  max_sequence_length: 8
+  truncate_prefix: true
+training:
+  stage1_updates: 1
+  memory_updates_per_cycle: 1
+  policy_updates_per_cycle: 1
+  stage1_accumulation_steps: 1
+  stage2_accumulation_steps: 1
+  alternating_cycles: 1
+  save_interval: 1

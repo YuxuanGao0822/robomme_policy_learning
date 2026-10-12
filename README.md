@@ -300,6 +300,10 @@ We offer three ways for model submission:
 We highly recommend that you first fully understand the MME-VLA policy learning pipeline before diving into this section.
 
 
+## T²Mem on PickXtimes
+
+The single-task JAX/Flax NNX implementation compares a self-trained π0.5 Stage 1 baseline, Full T²Mem initialized from that baseline, and a no-write intervention using the same T²Mem checkpoint. See [the reproduction guide](docs/t2mem_pickxtimes_reproduction.md) for Linux GPU 6 setup, training, evaluation, and the documented implementation differences. GPU training and simulator validation have not been run locally.
+
 ## 🛠️ Troubleshooting
 Q1: Vulkan installation fails.  
 A1: Please refer to the ManiSkill [solution](https://maniskill.readthedocs.io/en/latest/user_guide/getting_started/installation.html#vulkan). If it still does not work, we recommend reinstalling the NVIDIA driver and Vulkan packages. We use NVIDIA driver 570.211.01 and Vulkan 1.3.275. You can also switch to CPU rendering:

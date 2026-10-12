@@ -1,0 +1,12 @@
+# Single physical GPU 6, logical device 0. No FSDP and no silent truncation.
+# Full temporal second-order gradients may exceed 80 GB for long episodes.
+extends: t2mem_paper.yaml
+name: t2mem_a100_pickxtimes
+checkpoint_dir: runs/ckpts/t2mem_a100_pickxtimes
+training:
+  micro_batch_size: 1
+  stage1_accumulation_steps: 64
+  stage2_accumulation_steps: 32
+model:
+  dtype: bfloat16
+  remat: true

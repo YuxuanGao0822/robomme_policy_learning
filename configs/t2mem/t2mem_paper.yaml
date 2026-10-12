@@ -1,0 +1,63 @@
+# T²Mem Table 2/3 algorithm and sizes; single-task PickXtimes reproduction.
+# Constant LR, AdamW settings and demo sampling phase are engineering choices:
+# their exact values/phase are not disclosed for the released recipe.
+name: t2mem_paper_pickxtimes
+experiment_label: "single-task reproduction: PickXtimes"
+gpu_id: 6
+num_devices: 1
+seed: 7
+checkpoint_dir: runs/ckpts/t2mem_paper_pickxtimes
+pretrained_params: ${OPENPI_DATA_HOME}/openpi-assets/checkpoints/pi05_base/params
+model:
+  dtype: bfloat16
+  pi05: true
+  paligemma_variant: gemma_2b_lora
+  action_expert_variant: gemma_300m
+  discrete_state_input: false
+  action_dim: 32
+  robot_action_dim: 8
+  action_horizon: 64
+  max_token_len: 200
+  memory_enabled: true
+  remat: true
+  # Recompute whole temporal blocks; gradients cross every block boundary.
+  temporal_remat_block_size: 16
+  memory:
+    num_heads: 16
+    head_dim: 64
+    hidden_dim: 256
+    num_tokens: 16
+    width: 1024
+    adapter_rank: 16
+    adaptive_write: true
+    online_write: true
+    detach_fast_state: false
+data:
+  manifest: data/t2mem/manifest.json
+  norm_stats_dir: data/t2mem/assets/robomme
+  write_stride: 16
+  demonstration_write_offset: 0
+  action_supervision_stride: 1
+  task_sampling: uniform
+  max_sequence_length: null
+  truncate_prefix: false
+training:
+  micro_batch_size: 1
+  stage1_accumulation_steps: 64
+  stage2_accumulation_steps: 32
+  stage1_updates: 20000
+  memory_updates_per_cycle: 500
+  policy_updates_per_cycle: 500
+  alternating_cycles: null
+  stage1_lr: 0.00002
+  memory_lr: 0.000075
+  gate_lr: 0.0005
+  policy_lr: 0.00003
+  warmup_steps: 0
+  adam_b1: 0.9
+  adam_b2: 0.95
+  adam_eps: 0.00000001
+  weight_decay: 0.0000000001
+  outer_gradient_clip: 1.0
+  save_interval: 100
+  log_interval: 1

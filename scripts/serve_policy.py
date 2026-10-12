@@ -37,6 +37,15 @@ class Default:
 
 
 @dataclasses.dataclass
+class T2MemCheckpoint:
+    """Serve a T²Mem checkpoint using its saved architecture and stateful protocol."""
+
+    dir: str
+    ablation: str = "full"
+    num_denoise_steps: int = 10
+
+
+@dataclasses.dataclass
 class Args:
     """Arguments for the serve_policy script."""
 
@@ -54,7 +63,7 @@ class Args:
     seed: int = 42
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
-    policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+    policy: Checkpoint | T2MemCheckpoint | Default = dataclasses.field(default_factory=Default)
 
 
 # Default checkpoints that should be used for each environment.
@@ -78,6 +87,16 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 def create_policy(args: Args) -> _policy.MME_VLA_Policy:
     """Create a policy from the given arguments."""
     match args.policy:
+        case T2MemCheckpoint():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("t2mem_serve_entry", Path(__file__).parent / "t2mem" / "serve.py")
+            if spec is None or spec.loader is None:
+                raise ImportError("Cannot locate the T²Mem serving entry point.")
+            entry = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(entry)
+
+            return entry.load_policy(args.policy.dir, seed=args.seed, ablation=args.policy.ablation, num_steps=args.policy.num_denoise_steps)
         case Checkpoint():
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt,
@@ -95,7 +114,10 @@ def main(args: Args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
-    server = websocket_policy_server.WebsocketPolicyServer(
+    from mme_vla_suite.models.t2mem.policy import T2MemPolicy, T2MemWebsocketPolicyServer
+
+    server_cls = T2MemWebsocketPolicyServer if isinstance(policy, T2MemPolicy) else websocket_policy_server.WebsocketPolicyServer
+    server = server_cls(
         policy=policy,
         host="0.0.0.0",
         port=args.port,
