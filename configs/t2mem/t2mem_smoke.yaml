@@ -1,10 +1,11 @@
-# APPROXIMATION: last 8 retained observations start from W0; this tests runtime
+# APPROXIMATION: last 32 retained observations start from W0; this tests runtime
 # plumbing only and is not a scientific reproduction or a memory benchmark.
+# Two stride-16 intervals exercise writes followed by supervised reads.
 extends: t2mem_a100_80gb.yaml
 name: t2mem_smoke
 checkpoint_dir: runs/ckpts/t2mem_smoke
 data:
-  max_sequence_length: 8
+  max_sequence_length: 32
   truncate_prefix: true
 training:
   stage1_updates: 1

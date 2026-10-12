@@ -2,7 +2,7 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：用户 A100 日志中，旧版全套为 80 passed / 1 failed；修订后的四种等价性用例均已通过（4 passed，58.86s）。** 原失败是 memory-free 与原生 Gemma 的数值一致性，最高精度诊断支持其与矩阵计算精度相关。修订将精度限定在该测试内、保留原容差，四种padding/remat组合及逐层对照已由用户服务器验证。其余80项此前已通过；这些结果来自两轮运行，尚无新版全套一次运行的记录。完整模型训练和 simulator rollout 仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 已完成数据准备与 Stage 1 smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。Stage 2 smoke、正式训练及simulator rollout仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
 
 ## 1. 同步与环境安装
 
@@ -104,7 +104,7 @@ normalization 仅由该任务 training execution frames 计算：前 7 维关节
 |---|---|
 | `configs/t2mem/t2mem_paper.yaml` | 论文 Table 2/3 的 memory 参数、H64、stride16、完整梯度路径；缩减为 PickXtimes |
 | `configs/t2mem/t2mem_a100_80gb.yaml` | 单卡、BF16 backbone、FP32 slow master/fast weights、rematerialization、gradient accumulation |
-| `configs/t2mem/t2mem_smoke.yaml` | 一次 Stage 1 更新和一个 A/B cycle；**显式 approximation：保留序列末 8 个 observations，丢弃更早 history** |
+| `configs/t2mem/t2mem_smoke.yaml` | 一次 Stage 1 更新和一个 A/B cycle；**显式 approximation：保留序列末 32 个 observations，丢弃更早 history** |
 | `configs/t2mem/t2mem_ablation.yaml` | no-write 的配置示意；C 不使用它重新训练，而使用 B checkpoint + `--ablation no-online-write` |
 
 论文指定的部分：16 interface tokens，width1024；18 allocated / 17 effective memory layers；独立 Q/K/V；16 个 nonlinear fast-weight heads；64→256→64 exact GeLU MLP，含 biases；learned W0；FP32 fast state；Q/K/V RMS normalization、Q/K interleaved RoPE；channel-wise tanh gate 初值0.01；read-before-write。Eq. (5)–(8) 建立 observation-grounded read/write 和融合，Eq. (10)–(15) 实现 residual/displacement/alignment adaptive beta、JVP curvature calibration、learned positive multiplier。只有 beta 和 calibration stop-gradient，完整 fast-state recurrence 和 inner gradient 默认保留二阶梯度。beta=1 消融仍保留 curvature calibration。
@@ -118,7 +118,7 @@ Eq. (16) 的 Flow Matching objective 使用原有 OpenPI action/time embedding �
 - 单任务替代论文的 16-task 训练；batch accumulation 替代 32×H200；没有验证其训练时间或 A100 OOM 边界。
 - 复用 OpenPI 原生 AE 8-head attention 的扁平 rank-16 Q/KV/O interface adapters，总 adapter 参数为 2,211,840，论文列出的约 1.622M 的具体布局没有公开。不能声称参数树完全相同。
 - Interface 的 base attention/FFN 复用 AE 权重，memory norm 和 adapters 独立；这是与现有 OpenPI 权重兼容的实现选择。
-- 按当前结构静态计算，新增slow参数共68,525,074：read/write projections56,678,400，learnedW0 9,529,344，adapters2,211,840，interface norms36,864，interface tokens16,384，gates18,432，rho18及state projection33,792。W0的FP32 episode state仍为约36.35MiB。这些是结构计算，尚非服务器实际参数树测量。
+- 新增slow参数共68,525,074：read/write projections56,678,400，learnedW0 9,529,344，adapters2,211,840，interface norms36,864，interface tokens16,384，gates18,432，rho18及state projection33,792。用户Stage1启动时实际ownership计数为memory68,472,850 + gate18,432 + proprioception33,792，与上述总数一致。W0的FP32 episode state按结构计算约36.35MiB。
 - 所有 A/B/C 使用同一 input transform，生成 instruction-only 和 native π0.5 state+instruction 两种 tokenization。memory-free 路径使用 native π0.5 prompt；T²Mem 路径使用 VL-only prompt，并把 continuous proprioception 置于 suffix，确保 memory interface 不能访问 proprioception。normalization、相机、action convention、H64/E32、输入字典完全一致；论文没有公开该状态路由/adapter 的逐参数实现。
 - `max_token_len=200`、AdamW beta/epsilon、outer gradient clipping、常量 LR、示范时间线 offset=0 和每个 execution frame 都监督是兼容仓库的显式选择。Table 3 没有给出总 alternating cycles，因此正式训练必须显式指定 `--cycles`。
 - 默认 full episode prefix、`action_supervision_stride=1`、`detach_fast_state=false`。`max_sequence_length` 只有配合 `truncate_prefix=true` 才能开启；稀疏 supervision、截掉 prefix、detach fast state 都在 config、日志及 checkpoint 标记为 approximation。原论文 H64/E32、memory 容量不会被 A100 配置静默缩小。
@@ -133,6 +133,10 @@ PYTHONPATH=src uv run pytest -q tests/test_t2mem*.py
 ```
 
 测试涵盖 memory math/shape、reset/no leakage/no-write、界面 attention mask、earlier-write meta-gradient、stage ownership、PickXtimes-only filtering、chronological loader/padded-action masks、完整 checkpoint/optimizer/RNG/sampler resume、stateful write cadence。小型测试不构造 3B backbone；它们不能替代实际的 π0.5 compilation 与 training smoke。
+
+2026-10-12用户Stage1 smoke记录：官方100个training episodes准备成功；恢复π0.5-base参数12.5GiB；`step=1, stage=stage1`，loss=`6.271060943603516`，gradient norm=`20.71181297302246`，effective batch=1，scheduled memory writes=0。`runs/ckpts/t2mem_smoke_stage1/1`的params及train_state均完成保存，phase progress为`complete=True`。这验证了一次真实前向/反向/优化更新和保存，未验证正式训练收敛或完整resume round-trip。ROCm/TPU探测信息不表示NVIDIA CUDA失败；Orbax的process metadata提示对应保存前`jax.device_get`后的host NumPy数组，日志有成功finalize和Saved记录。
+
+Stage2 smoke窗口已从8改为32。长执行episode的32帧尾窗口包含两个stride16写入，且第一个写入后有监督读取；原8帧可能没有写入，或唯一写入在最后一帧。它仍是从窗口W0开始的截断近似，不能代表full-episode显存表现。该data设置不改变model架构或normalization，可直接复用上述Stage1/1 checkpoint。
 
 分别运行 A 和 B 的 smoke：
 
@@ -275,4 +279,4 @@ git diff --check
 for script in scripts/t2mem/*.sh; do bash -n "$script"; done
 ```
 
-新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器旧版全套80项通过、1项数值一致性失败；修订后的四种等价性用例随后全部通过（4 passed，58.86s）。3B模型checkpoint加载、实际GPUtraining/inference、simulatorrollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
+新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器四种等价性用例全部通过；实际PickXtimes数据准备、π0.5-base恢复、Stage1一次GPU优化更新和checkpoint保存也已完成。Stage2、正式长序列训练、完整resume round-trip、policy inference、simulator rollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
