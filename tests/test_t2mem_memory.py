@@ -485,38 +485,106 @@ def test_integrated_bf16_cache_preserves_fp32_recurrence(tiny_transformer):
     assert bool(jnp.all(jnp.isfinite(prediction)))
 
 
-def test_memory_free_path_matches_native_gemma_with_identical_policy_weights(tiny_transformer):
+@pytest.mark.parametrize("valid_bits", [(True, True, True), (True, True, False)], ids=["all-valid", "padded-vl"])
+@pytest.mark.parametrize("remat", [False, True], ids=["no-remat", "remat"])
+def test_memory_free_path_matches_native_gemma_with_identical_policy_weights(tiny_transformer, valid_bits, remat):
     """Checkpoint names and separated KV decode retain native pi05 behavior.
 
-    Run the existing native Block directly to isolate weight/mask compatibility
-    from the stock Module's independent rematerialization configuration.
+    GPU float32 array storage does not guarantee full float32 dot-product
+    precision. The joint native attention and the split/padded cache use
+    different matrix and reduction shapes, so test semantic equivalence at
+    highest matmul precision while retaining the original 2e-5 tolerance.
+    Per-layer cache and suffix comparisons locate any remaining discrepancy;
+    this context does not change production model precision.
     """
-    module, variables = tiny_transformer
-    state = module.apply(variables, 1, method="initial_memory_state")
-    prefix = jax.random.normal(jax.random.key(20), (1, 3, 64))
-    suffix = jax.random.normal(jax.random.key(21), (1, 2, 64))
-    valid = jnp.array([[True, True, False]])
-    cond = jnp.zeros((1, 64))
-    cache, unchanged_state, _ = module.apply(
-        variables, prefix, valid, state, jnp.array([False]), memory_enabled=False, method="encode"
-    )
-    actual = module.apply(variables, suffix, valid, cache, cond, memory_enabled=False, method="decode")
-    assert_tree_close(unchanged_state, state, atol=0)
-    total_valid = jnp.concatenate((valid, jnp.ones(suffix.shape[:2], dtype=bool)), axis=-1)
-    positions = jnp.cumsum(total_valid, axis=-1) - 1
-    vl_rows = jnp.concatenate(
-        (jnp.broadcast_to(valid[:, None, :], (1, 3, 3)), jnp.zeros((1, 3, 2), dtype=bool)), axis=-1
-    ) & valid[:, :, None]
-    action_rows = jnp.broadcast_to(total_valid[:, None, :], (1, 2, 5))
-    mask = jnp.concatenate((vl_rows, action_rows), axis=-2)[:, None]
-    tokens = [prefix, suffix]
-    parameters = variables["params"]
-    for layer in range(module.configs[0].depth):
-        layer_params = jax.tree.map(lambda weights: weights[layer], parameters["layers"])
-        tokens, _ = gemma.Block(module.configs, parent=None).apply(
-            {"params": layer_params}, tokens, None, positions, mask, [None, cond], True
+    original, variables = tiny_transformer
+    module = memory_gemma.Module(original.configs, original.embed_dtype, original.memory_config, remat=remat)
+    with jax.default_matmul_precision("highest"):
+        state = module.apply(variables, 1, method="initial_memory_state")
+        prefix = jax.random.normal(jax.random.key(20), (1, 3, 64))
+        suffix = jax.random.normal(jax.random.key(21), (1, 2, 64))
+        valid = jnp.array([valid_bits])
+        cond = jnp.zeros((1, 64))
+        cache, unchanged_state, _ = module.apply(
+            variables, prefix, valid, state, jnp.array([False]), memory_enabled=False, method="encode"
         )
-    expected = gemma.RMSNorm(parent=None).apply(
-        {"params": parameters["final_norm_1"]}, tokens[1], cond
-    )[0]
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        actual = module.apply(variables, suffix, valid, cache, cond, memory_enabled=False, method="decode")
+        assert_tree_close(unchanged_state, state, atol=0)
+        total_valid = jnp.concatenate((valid, jnp.ones(suffix.shape[:2], dtype=bool)), axis=-1)
+        positions = jnp.cumsum(total_valid, axis=-1) - 1
+        vl_rows = jnp.concatenate(
+            (jnp.broadcast_to(valid[:, None, :], (1, 3, 3)), jnp.zeros((1, 3, 2), dtype=bool)), axis=-1
+        ) & valid[:, :, None]
+        action_rows = jnp.broadcast_to(total_valid[:, None, :], (1, 2, 5))
+        native_mask = jnp.concatenate((vl_rows, action_rows), axis=-2)[:, None]
+
+        # Baseline IF slots are allocated but never visible. Build the same
+        # split mask explicitly for layer-by-layer suffix diagnostics.
+        n = module.memory_config.num_tokens
+        cached_valid = jnp.concatenate((valid, jnp.zeros((1, n), dtype=bool)), axis=-1)
+        split_prefix = jnp.broadcast_to(cached_valid[:, None, :], (1, suffix.shape[1], 3 + n))
+        split_mask = jnp.concatenate((split_prefix, jnp.ones((1, 2, 2), dtype=bool)), axis=-1)[:, None]
+        suffix_positions = jnp.sum(valid, axis=-1)[:, None] + jnp.arange(suffix.shape[1])[None]
+
+        tokens, split_suffix, native_cached_suffix = [prefix, suffix], suffix, suffix
+        parameters = variables["params"]
+        layer_errors = []
+        for layer in range(module.configs[0].depth):
+            layer_params = jax.tree.map(lambda weights: weights[layer], parameters["layers"])
+            tokens, native_cache = gemma.Block(module.configs, parent=None).apply(
+                {"params": layer_params}, tokens, None, positions, native_mask, [None, cond], True
+            )
+            for kind, cached, native in zip(("K", "V"), cache, native_cache, strict=True):
+                # Native Gemma averages an all-masked VL query; the T²Mem
+                # implementation returns zero. Those invalid tokens are never
+                # visible to valid VL/action queries, so compare valid KV only.
+                np.testing.assert_allclose(
+                    np.asarray(cached[layer])[:, :3][:, np.asarray(valid_bits)],
+                    np.asarray(native)[:, :3][:, np.asarray(valid_bits)],
+                    rtol=2e-5, atol=2e-5,
+                    err_msg=f"Layer {layer} valid-prefix {kind} cache mismatch at highest precision; remat={remat}",
+                )
+            (split_tokens, _), _ = memory_gemma.Block(module.configs, module.memory_config, parent=None).apply(
+                {"params": layer_params}, ([None, split_suffix], None), tuple(part[layer] for part in cache),
+                None, layer, suffix_positions, split_mask, cond, jnp.array([False]), "decode",
+            )
+            split_suffix = split_tokens[1]
+            # Same cached keys, including the masked dummy IF slots, isolate
+            # attention/FFN semantics from joint-vs-cached matrix shapes.
+            cached_tokens, _ = gemma.Block(module.configs, parent=None).apply(
+                {"params": layer_params}, [None, native_cached_suffix], tuple(part[layer] for part in cache),
+                suffix_positions, split_mask, [None, cond], True,
+            )
+            native_cached_suffix = cached_tokens[1]
+            np.testing.assert_allclose(
+                split_suffix, native_cached_suffix, rtol=2e-5, atol=2e-5,
+                err_msg=f"Layer {layer} custom/native cached semantics mismatch with identical key layout; "
+                        f"precision={jax.config.jax_default_matmul_precision}; remat={remat}",
+            )
+            layer_errors.append(float(np.max(np.abs(np.asarray(split_suffix) - np.asarray(tokens[1])))))
+            np.testing.assert_allclose(
+                split_suffix, tokens[1], rtol=2e-5, atol=2e-5,
+                err_msg=f"Layer {layer} suffix mismatch at highest precision; max errors={layer_errors}; remat={remat}",
+            )
+        expected = gemma.RMSNorm(parent=None).apply(
+            {"params": parameters["final_norm_1"]}, tokens[1], cond
+        )[0]
+        np.testing.assert_allclose(
+            actual, expected, rtol=2e-5, atol=2e-5,
+            err_msg=f"Final suffix mismatch; precision={jax.config.jax_default_matmul_precision}; "
+                    f"maxabs={float(np.max(np.abs(np.asarray(actual) - np.asarray(expected))))}; "
+                    f"layer max errors={layer_errors}; remat={remat}",
+        )
+        if not all(valid_bits):
+            poisoned = prefix.at[:, 2, :].set(jnp.linspace(-1e4, 1e4, prefix.shape[-1]))
+            poisoned_cache, poisoned_state, _ = module.apply(
+                variables, poisoned, valid, state, jnp.array([False]), memory_enabled=False, method="encode"
+            )
+            poisoned_output = module.apply(
+                variables, suffix, valid, poisoned_cache, cond, memory_enabled=False, method="decode"
+            )
+            assert_tree_close(poisoned_state, state, atol=0)
+            np.testing.assert_allclose(
+                poisoned_output, actual, rtol=2e-5, atol=2e-5,
+                err_msg="An invalid VL token changed baseline actions despite its masked key",
+            )

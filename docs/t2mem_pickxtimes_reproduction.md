@@ -2,7 +2,7 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：GPU tests = NOT RUN — requires Linux A100。** Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 日志中，旧版测试为 80 passed / 1 failed。** 唯一失败项是 memory-free 与原生 Gemma 的数值一致性，最大绝对误差约`5.65e-5`；当前修订固定该测试的矩阵乘精度并补充逐层对照，等待服务器重跑。完整模型训练和 simulator rollout 仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
 
 ## 1. 同步与环境安装
 
@@ -119,7 +119,7 @@ Eq. (16) 的 Flow Matching objective 使用原有 OpenPI action/time embedding �
 
 ## 4. 服务器 tests 和训练 smoke
 
-在服务器运行以下测试。它们当前均为 **NOT RUN — requires Linux A100**：
+在服务器运行以下测试。2026-10-12 用户提供的旧版测试日志为`80 passed, 1 failed`；失败的数值一致性测试和本轮补充用例修订后尚未重跑，不能将其报告为通过：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=6
@@ -269,4 +269,4 @@ git diff --check
 for script in scripts/t2mem/*.sh; do bash -n "$script"; done
 ```
 
-新增文件也进行了AST/语法和接口静态审查。所有JAX tests、实际checkpoint round-trip、GPUtraining/inference、simulatorrollout和success rates均为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
+新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器旧版81项测试中80项通过，1项数值一致性失败；修订版测试等待重跑。3B模型checkpoint加载、实际GPUtraining/inference、simulatorrollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
