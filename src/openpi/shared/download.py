@@ -114,6 +114,9 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
             time.sleep(1)
+        # A completed future may have failed. Propagate its exception before
+        # marking progress complete or promoting partial files into the cache.
+        future.result()
         pbar.update(total_size - pbar.n)
 
 

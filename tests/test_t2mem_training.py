@@ -72,6 +72,49 @@ def test_only_pickxtimes_is_indexed(training_data):
         load_manifest(root / "invalid.json")
 
 
+def test_official_release_filename_preserves_episode_sequence(training_data):
+    root, legacy_manifest = training_data
+    official = root / "record_dataset_PickXtimes.h5"
+    (root / "data_PickXtimes.h5").rename(official)
+    # Match the official RecordWrapper's variable-length task_goal encoding;
+    # indexing this HDF5 object array returns Python bytes, not np.bytes_.
+    with h5py.File(official, "r+") as source:
+        del source["episode_4/setup/task_goal"]
+        source.create_dataset("episode_4/setup/task_goal", data=np.asarray(["Pick up three times"], dtype=object),
+                              dtype=h5py.string_dtype(encoding="utf-8"))
+    manifest = build_manifest(root, root / "official_manifest.json")
+    assert manifest["task_counts"] == {"PickXtimes": 1}
+    assert manifest["episodes"][0]["path"] == str(official)
+    assert manifest["episodes"][0]["prompt"] == "Pick up three times"
+    # File naming must not alter original episode IDs, chronology, targets,
+    # or the expected physical-time write schedule.
+    assert manifest["episodes"][0]["episode"] == legacy_manifest["episodes"][0]["episode"] == "episode_4"
+    assert load_manifest(root / "official_manifest.json")["episodes"] == manifest["episodes"]
+    sample = EpisodeSampler(manifest, transform).sample("PickXtimes", stage1=False)
+    np.testing.assert_array_equal(sample.physical_steps, [0, 1, 2])
+    np.testing.assert_array_equal(sample.write_mask, [True, False, False])
+    np.testing.assert_array_equal(sample.actions[0, :3, 0], [0, 1, 2])
+
+
+def test_ambiguous_official_and_legacy_files_are_rejected(training_data):
+    root, _ = training_data
+    # Even identical content under two names is ambiguous: choosing one could
+    # silently use a stale copy after the official release is updated.
+    (root / "record_dataset_PickXtimes.h5").symlink_to(root / "data_PickXtimes.h5")
+    with pytest.raises(ValueError, match="Ambiguous PickXtimes"):
+        build_manifest(root, root / "ambiguous_manifest.json")
+
+
+def test_manifest_cannot_relabel_another_task_as_pickxtimes(training_data):
+    root, manifest = training_data
+    for filename in ("data_VideoUnmask.h5", "record_dataset_VideoUnmask.h5",
+                     "record_dataset_PatternLock.h5"):
+        invalid = {**manifest, "episodes": [{**manifest["episodes"][0], "path": str(root / filename)}]}
+        (root / "relabelled_manifest.json").write_text(json.dumps(invalid))
+        with pytest.raises(ValueError, match="task identity"):
+            load_manifest(root / "relabelled_manifest.json")
+
+
 def test_held_out_split_rejected(training_data):
     root, _ = training_data
     with h5py.File(root / "data_PickXtimes.h5", "r+") as source:

@@ -2,7 +2,7 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：用户 A100 日志中，旧版全套为 80 passed / 1 failed；失败项以最高矩阵乘精度单独重跑后为 1 passed。** 原失败是 memory-free 与原生 Gemma 的数值一致性，最大绝对误差约`5.65e-5`，最高精度诊断支持其与矩阵计算精度相关。当前修订将精度限定在该测试内、保留原容差，并补充四种padding/remat组合及逐层对照；新增用例等待服务器重跑。完整模型训练和 simulator rollout 仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 日志中，旧版全套为 80 passed / 1 failed；修订后的四种等价性用例均已通过（4 passed，58.86s）。** 原失败是 memory-free 与原生 Gemma 的数值一致性，最高精度诊断支持其与矩阵计算精度相关。修订将精度限定在该测试内、保留原容差，四种padding/remat组合及逐层对照已由用户服务器验证。其余80项此前已通过；这些结果来自两轮运行，尚无新版全套一次运行的记录。完整模型训练和 simulator rollout 仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
 
 ## 1. 同步与环境安装
 
@@ -75,7 +75,7 @@ uv run python scripts/tarxz_h5.py decompress --input_dir data/robomme_pickxtimes
 bash scripts/t2mem/prepare_data.sh --official-train-root data/robomme_pickxtimes_h5 --output-dir data/t2mem
 ```
 
-下载脚本只匹配官方 [Yinpei/robomme_data_h5](https://huggingface.co/datasets/Yinpei/robomme_data_h5) 的 `*PickXtimes*` 文件。数据准备期望解压后的 `data_PickXtimes.h5` 位于指定 root；若 release 的目录布局发生变化，显式将 `--official-train-root` 指向包含该文件的目录。不要把 benchmark test recordings、生成的 test episodes 或任何 validation 文件放到此目录。
+下载脚本只匹配官方 [Yinpei/robomme_data_h5](https://huggingface.co/datasets/Yinpei/robomme_data_h5/tree/main) 的 `*PickXtimes*` 文件。当前官方 archive 为`record_dataset_PickXtimes.h5.tar.xz`，数据准备接受解压后的`record_dataset_PickXtimes.h5`，并兼容历史名称`data_PickXtimes.h5`。同一root同时存在两个名称时拒绝歧义，避免混用版本。若release目录布局变化，显式将`--official-train-root`指向包含该文件的目录。不要把benchmark test recordings、生成的test episodes或validation文件放到此目录。
 
 输出：
 
@@ -84,7 +84,13 @@ data/t2mem/manifest.json
 data/t2mem/assets/robomme/norm_stats.json
 ```
 
-准备流程只打开 `data_PickXtimes.h5`，使用其 `episode_N/timestep_N` 的真实连续时间线和 `info/is_video_demo` 分段，不依赖旧 pickle 中不存在的 task-name 字段。不读取 subgoal、抓取计数或 success/task-progress 来形成 memory。显式 held-out 文件路径及 HDF5 split metadata 被拒绝；文件名本身不能证明数据来源，因此 manifest 记录操作者提供的官方 training-release 来源声明。
+准备流程只打开明确命名的PickXtimes HDF5，使用其`episode_N/timestep_N`的真实连续时间线和`info/is_video_demo`分段，不依赖旧pickle中不存在的task-name字段。language instruction兼容官方HDF5的variable-length UTF-8字符串。不读取subgoal、抓取计数或success/task-progress来形成memory。显式held-out文件路径及HDF5 split metadata被拒绝；文件名本身不能证明数据来源，因此manifest记录操作者提供的官方training-release来源声明。
+
+π0.5-base从GCS下载，`HF_ENDPOINT`只影响HF数据下载。GCS后台传输异常现在会向调用者抛出，失败的`.partial`文件不会升级成已完成cache；不要把传输失败当作checkpoint下载成功。本轮新增的文件名兼容及下载失败/retry回归测试尚未在服务器执行，可单独运行：
+
+```bash
+PYTHONPATH=src uv run pytest -q tests/test_t2mem_training.py tests/test_t2mem_download.py
+```
 
 没有重复存储每个 sample 的历史图像，也不下载单独的 vision-encoder checkpoint。训练期间按 episode 懒加载原始 front/wrist RGB 和 8 维 robot state。旧数据 builder 只保留 execution pickle，且 action horizon=20/end padding 无 mask，不能用于本实现的完整时序 H64 训练。
 
@@ -119,7 +125,7 @@ Eq. (16) 的 Flow Matching objective 使用原有 OpenPI action/time embedding �
 
 ## 4. 服务器 tests 和训练 smoke
 
-在服务器运行以下测试。2026-10-12 用户提供的旧版全套日志为`80 passed, 1 failed`；随后使用`JAX_DEFAULT_MATMUL_PRECISION=highest`单独重跑失败项，结果为`1 passed`。修订后的该测试自行限定最高矩阵精度，覆盖padding/remat四种组合，新增用例尚未重跑，不能将其报告为通过：
+在服务器运行以下测试。2026-10-12 用户提供的旧版全套日志为`80 passed, 1 failed`；随后最高精度单项诊断为`1 passed`，同步修订后padding/remat四种组合为`4 passed`（58.86s）。修订测试自行限定最高矩阵精度，不需要为正式训练全局设置该变量。其余80项此前已通过；以下命令可获取新版全套的一次运行记录：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=6
@@ -269,4 +275,4 @@ git diff --check
 for script in scripts/t2mem/*.sh; do bash -n "$script"; done
 ```
 
-新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器旧版全套80项通过、1项数值一致性失败；该失败项随后在最高矩阵精度下单独重跑通过。修订后的四种等价性用例等待重跑。3B模型checkpoint加载、实际GPUtraining/inference、simulatorrollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
+新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器旧版全套80项通过、1项数值一致性失败；修订后的四种等价性用例随后全部通过（4 passed，58.86s）。3B模型checkpoint加载、实际GPUtraining/inference、simulatorrollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。

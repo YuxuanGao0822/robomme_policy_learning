@@ -23,9 +23,18 @@ TASKS = ("PickXtimes",)
 MANIFEST_VERSION = 1
 
 
+def training_filenames(task: str) -> tuple[str, str]:
+    """Official release name and the original loader's compatible alias."""
+    if task not in TASKS:
+        raise ValueError(f"Unsupported training task {task}")
+    return f"record_dataset_{task}.h5", f"data_{task}.h5"
+
+
 def _scalar(value: Any) -> Any:
     value = np.asarray(value)
-    result = value.reshape(-1)[0].item()
+    # HDF5 variable-length strings produce object arrays whose indexed values
+    # are already Python bytes/str, unlike fixed-width NumPy scalar strings.
+    result = value.reshape(-1).item(0)
     return result.decode() if isinstance(result, bytes) else result
 
 
@@ -49,10 +58,14 @@ def build_manifest(raw_root: str | Path, output: str | Path, *, max_episodes: in
         raise ValueError("max_episodes must be positive")
     episodes = []
     for task in TASKS:
-        path = root / f"data_{task}.h5"
+        candidates = [root / name for name in training_filenames(task)]
+        existing = [path for path in candidates if path.is_file()]
+        if len(existing) > 1:
+            raise ValueError(f"Ambiguous {task} training source; retain only one of: {existing}")
+        if not existing:
+            raise FileNotFoundError(f"Expected official {task} training file; checked: {candidates}")
+        path = existing[0]
         validate_train_source(path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Expected official task training file: {path}")
         with h5py.File(path, "r") as file:
             split = _scalar(file.attrs["split"]) if "split" in file.attrs else "train"
             if str(split).lower() not in ("train", "training"):
@@ -100,7 +113,7 @@ def load_manifest(path: str | Path) -> dict:
         if entry["task"] not in TASKS:
             raise ValueError(f"Unexpected task {entry['task']}")
         validate_train_source(Path(entry["path"]))
-        if Path(entry["path"]).name != f"data_{entry['task']}.h5":
+        if Path(entry["path"]).name not in training_filenames(entry["task"]):
             raise ValueError("Episode task identity must match the official HDF5 filename")
     if set(e["task"] for e in manifest["episodes"]) != set(TASKS):
         raise ValueError("PickXtimes needs at least one official training episode")
