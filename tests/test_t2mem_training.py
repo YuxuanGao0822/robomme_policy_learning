@@ -15,12 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from mme_vla_suite.models.t2mem.configuration import RunConfig
+from mme_vla_suite.models.t2mem.configuration import RunConfig, load_run_config
 from mme_vla_suite.models.t2mem.dataset import (
     EpisodeSampler, TASKS, build_manifest, collate_sequences, load_manifest, read_frame,
 )
 from mme_vla_suite.models.t2mem.training import (
-    PhaseProgress, Trainer, latest_checkpoint, load_initial_parameters, parameter_group, stage_filter,
+    PhaseProgress, Trainer, _prune_checkpoints, latest_checkpoint, load_initial_parameters, parameter_group, stage_filter,
 )
 
 
@@ -265,3 +265,164 @@ def test_temporal_rematerialization_configuration():
         config = RunConfig(model={"robot_action_dim": invalid})
         with pytest.raises(ValueError, match="robot_action_dim=8"):
             config.validate()
+
+
+def test_checkpoint_retention_configuration_and_old_metadata(tmp_path):
+    old_metadata = tmp_path / "metadata.json"
+    old_metadata.write_text(json.dumps({"config": {"training": {"save_interval": 100}}}))
+    config = load_run_config(old_metadata)
+    assert config.training.keep_last_checkpoints is None
+    for keep in (None, 1, 2):
+        config.training.keep_last_checkpoints = keep
+        config.validate()
+    for invalid in (0, -1, True, False, 1.5, "2"):
+        config.training.keep_last_checkpoints = invalid
+        with pytest.raises(ValueError, match="keep_last_checkpoints.*positive integer"):
+            config.validate()
+    repository = Path(__file__).resolve().parents[1]
+    assert load_run_config(repository / "configs/t2mem/t2mem_a100_80gb.yaml").training.keep_last_checkpoints == 2
+    assert load_run_config(repository / "configs/t2mem/t2mem_smoke.yaml").training.keep_last_checkpoints == 2
+
+
+def _path_checkpoint(path, step, **metadata_overrides):
+    path.mkdir(parents=True)
+    (path / "params").mkdir()
+    (path / "train_state").mkdir()
+    (path / "params/payload").write_bytes(b"keep checkpoint payload")
+    metadata = {"format_version": 1, "complete": True, "progress": {"global_step": step}, **metadata_overrides}
+    (path / "metadata.json").write_text(json.dumps(metadata))
+    return path
+
+
+def _retention_trainer(tmp_path, manifest, keep=2):
+    config = RunConfig(checkpoint_dir=str(tmp_path / "run"))
+    config.training.keep_last_checkpoints = keep
+    config.data.norm_stats_dir = str(tmp_path / "stats")
+    (tmp_path / "stats").mkdir()
+    (tmp_path / "stats/norm_stats.json").write_text("{}")
+    return Trainer(TinyModel(), config, PhaseProgress.start("stage1"), EpisodeSampler(manifest, transform))
+
+
+def test_checkpoint_retention_keeps_latest_two_and_ignores_unrelated_paths(training_data, tmp_path, monkeypatch):
+    from mme_vla_suite.models.t2mem import training
+
+    _, manifest = training_data
+    trainer = _retention_trainer(tmp_path, manifest)
+    root = Path(trainer.config.checkpoint_dir)
+    original_prune = training._prune_checkpoints
+    committed = []
+
+    def prune_after_commit(run_root, keep_last, *, current_checkpoint, initialization_source=None):
+        assert json.loads((current_checkpoint / "metadata.json").read_text())["complete"] is True
+        assert (current_checkpoint / "params").is_dir() and (current_checkpoint / "train_state").is_dir()
+        assert (current_checkpoint / "assets/robomme/norm_stats.json").is_file()
+        committed.append(current_checkpoint)
+        return original_prune(run_root, keep_last, current_checkpoint=current_checkpoint,
+                              initialization_source=initialization_source)
+
+    monkeypatch.setattr(training, "_prune_checkpoints", prune_after_commit)
+    external = _path_checkpoint(tmp_path / "external/6", 6)
+    root.mkdir()
+    (root / "0").symlink_to(external, target_is_directory=True)
+    incomplete = root / "99"
+    incomplete.mkdir()
+    (incomplete / "params").mkdir()
+    _path_checkpoint(root / "notes", 0)
+    _path_checkpoint(root / "4", 4, format_version=2)
+    _path_checkpoint(root / "5", 5, complete=False)
+    _path_checkpoint(root / "6", 6)
+    (root / "6/metadata.json").unlink()
+    (root / "6/metadata.json").symlink_to(external / "metadata.json")
+    _path_checkpoint(root / "7", 999)
+    _path_checkpoint(root / "8", 8)
+    (root / "8/metadata.json").write_text("broken json")
+    _path_checkpoint(root / "9", 9)
+    (root / "9/params/payload").unlink()
+    (root / "9/params").rmdir()
+    (root / "9/params").symlink_to(external / "params", target_is_directory=True)
+    for step in (1, 2, 3):
+        trainer.progress.global_step = step
+        checkpoint = trainer.save()
+        assert checkpoint == root / str(step)
+        assert json.loads((checkpoint / "metadata.json").read_text())["complete"] is True
+        assert (checkpoint / "params").is_dir() and (checkpoint / "train_state").is_dir()
+        assert (checkpoint / "assets/robomme/norm_stats.json").is_file()
+        if step == 2:
+            assert (root / "1").is_dir()
+    assert not (root / "1").exists()
+    assert (root / "2").is_dir() and (root / "3").is_dir()
+    assert committed == [root / str(step) for step in (1, 2, 3)]
+    for name in ("0", "4", "5", "6", "7", "8", "9", "99", "notes"):
+        assert (root / name).exists()
+    assert (external / "params/payload").read_bytes() == b"keep checkpoint payload"
+
+
+@pytest.mark.parametrize("source_suffix", ("1", "1/params"))
+def test_checkpoint_retention_protects_initialization_source(tmp_path, source_suffix):
+    root = tmp_path / "run"
+    for step in (1, 2, 3, 4):
+        _path_checkpoint(root / str(step), step)
+    _prune_checkpoints(root, 2, current_checkpoint=root / "4", initialization_source=str(root / source_suffix))
+    assert (root / "1").is_dir()
+    assert not (root / "2").exists()
+    assert (root / "3").is_dir() and (root / "4").is_dir()
+
+
+def test_checkpoint_retention_none_preserves_all(tmp_path):
+    root = tmp_path / "run"
+    for step in (1, 2, 3):
+        _path_checkpoint(root / str(step), step)
+    _prune_checkpoints(root, None, current_checkpoint=root / "3")
+    assert all((root / str(step)).is_dir() for step in (1, 2, 3))
+
+
+def test_checkpoint_retention_waits_for_successful_save(training_data, tmp_path, monkeypatch):
+    from mme_vla_suite.models.t2mem import training
+
+    _, manifest = training_data
+    trainer = _retention_trainer(tmp_path, manifest)
+    root = Path(trainer.config.checkpoint_dir)
+    for step in (1, 2):
+        trainer.progress.global_step = step
+        trainer.save()
+
+    class FailedCheckpointer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def save(self, *_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(training.ocp, "PyTreeCheckpointer", FailedCheckpointer)
+    trainer.progress.global_step = 3
+    with pytest.raises(OSError, match="No space left"):
+        trainer.save()
+    assert not (root / "3/metadata.json").exists()
+    assert (root / "1/metadata.json").is_file() and (root / "2/metadata.json").is_file()
+
+
+def test_checkpoint_retention_cleanup_failure_warns_without_invalidating_save(training_data, tmp_path, monkeypatch, caplog):
+    from mme_vla_suite.models.t2mem import training
+
+    _, manifest = training_data
+    trainer = _retention_trainer(tmp_path, manifest)
+    root = Path(trainer.config.checkpoint_dir)
+    for step in (1, 2):
+        trainer.progress.global_step = step
+        trainer.save()
+    original_rmtree = training.shutil.rmtree
+
+    def cannot_remove_old(path, *args, **kwargs):
+        if Path(path) == root / "1":
+            raise OSError(13, "Permission denied")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(training.shutil, "rmtree", cannot_remove_old)
+    trainer.progress.global_step = 3
+    assert trainer.save() == root / "3"
+    assert (root / "3/metadata.json").is_file()
+    assert all((root / str(step)).is_dir() for step in (1, 2, 3))
+    assert "Checkpoint saved, but retention could not remove" in caplog.text

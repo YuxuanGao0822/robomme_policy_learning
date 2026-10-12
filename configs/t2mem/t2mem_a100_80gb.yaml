@@ -7,6 +7,8 @@ training:
   micro_batch_size: 1
   stage1_accumulation_steps: 64
   stage2_accumulation_steps: 32
+  # Prune only after a new full checkpoint commits; writing it needs extra space.
+  keep_last_checkpoints: 2
 model:
   dtype: bfloat16
   remat: true

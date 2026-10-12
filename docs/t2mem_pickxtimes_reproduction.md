@@ -2,7 +2,9 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：用户 A100 已完成数据准备与 Stage 1 smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。Stage 2 smoke、正式训练及simulator rollout仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 已完成数据准备、Stage 1/2训练smoke及推理/仿真smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。Stage 2从该checkpoint初始化，2A/2B各完成一次更新，每次32个observations、2次memory writes，最终checkpoint `runs/ckpts/t2mem_smoke_stage2/2`保存完成。该checkpoint的seed7、两个easy test episodes均完成rollout，状态为timeout：`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`；短训练的0/2不是正式性能结果。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。正式长序列训练、完整resume round-trip及150-rollout A/B/C评估仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+
+完整前缀诊断已启动：最长`episode_27`有1025个observations，padding到2048；Stage2A完成一次更新、65次writes、finite loss/gradient，`approximations=[]`。随后首次checkpoint保存遇到`ENOSPC / No space left on device`，训练退出；该1025帧Stage2B尚未执行，整轮诊断未完成，不能把这次磁盘错误描述为GPU OOM或完整训练通过。
 
 ## 1. 同步与环境安装
 
@@ -26,7 +28,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 `setup_server.sh` 拒绝在 Mac 运行。若缺少 uv，使用官方 installer 将它安装到`$HOME/.local/bin`，不修改 shell profile；因此脚本运行后需要上述 PATH 命令。使用 curl 或 wget 下载 installer，无需先安装系统 Python。uv 选择 Python 3.11，缺少兼容解释器时按需下载到用户目录；已有集群 Python 可用`T2MEM_PYTHON=/path/to/python3.11 bash scripts/t2mem/setup_server.sh`指定。脚本初始化 simulator submodule，执行`uv sync --python 3.11 --group dev`和 editable install。参考[uv 安装](https://docs.astral.sh/uv/getting-started/installation/)及[Python 管理](https://docs.astral.sh/uv/guides/install-python/)。
 
-训练环境采用仓库已有版本（JAX CUDA12 0.5.3、Flax 0.10.2、Orbax 0.11.13）。`jax[cuda12]`通过 Python 包安装 CUDA/cuDNN 用户态依赖；此路径无需安装系统 CUDA Toolkit，但不能安装或替代服务器的 NVIDIA kernel driver。已有 driver 必须兼容 CUDA12，实际是否可用以之后的`jax.devices()`检查为准。不要因为`nvidia-smi`显示的 CUDA 版本就重新安装 Toolkit；该显示也不证明 Vulkan 可用。参考[JAX GPU 安装](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu)。这些依赖尚未在目标服务器验证。无需为本实现安装 FlashAttention。过期的`sandbox2/flash_attn_jax`workspace member已移除，因为该目录不在 checkout 中。
+训练环境采用仓库已有版本（JAX CUDA12 0.5.3、Flax 0.10.2、Orbax 0.11.13）。`jax[cuda12]`通过 Python 包安装 CUDA/cuDNN 用户态依赖；此路径无需安装系统 CUDA Toolkit，但不能安装或替代服务器的 NVIDIA kernel driver。已有 driver 必须兼容 CUDA12，实际是否可用以`jax.devices()`及训练检查为准。不要因为`nvidia-smi`显示的 CUDA 版本就重新安装 Toolkit；该显示也不证明 Vulkan 可用。参考[JAX GPU 安装](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu)。用户服务器已识别CUDA设备，完成Stage 1/2训练smoke和两个simulator rollouts。无需为本实现安装 FlashAttention。过期的`sandbox2/flash_attn_jax`workspace member已移除，因为该目录不在 checkout 中。
 
 PickXtimes 数据下载使用 Hugging Face HTTP API，π0.5-base 使用仓库的 GCS downloader，这两个命令不要求 git-lfs。若其他 checkout/submodule 报缺少 git-lfs，可从已有集群 module 或用户环境提供；不要执行需要系统权限的安装。若某个依赖需要从源码编译，编译器也应从集群 module 或用户环境提供。
 
@@ -138,6 +140,14 @@ PYTHONPATH=src uv run pytest -q tests/test_t2mem*.py
 
 Stage2 smoke窗口已从8改为32。长执行episode的32帧尾窗口包含两个stride16写入，且第一个写入后有监督读取；原8帧可能没有写入，或唯一写入在最后一帧。它仍是从窗口W0开始的截断近似，不能代表full-episode显存表现。该data设置不改变model架构或normalization，可直接复用上述Stage1/1 checkpoint。
 
+2026-10-12用户Stage2 smoke记录：从上述Stage1/1恢复参数，`step=1, stage=stage2a`的loss=`10.479398727416992`、gradient norm=`1.6982085704803467`；`step=2, stage=stage2b`的loss=`9.98141860961914`、gradient norm=`47.425445556640625`。两个阶段均为effective batch=1、sequence length=32、supervised frames=32、scheduled memory writes=2。最终`runs/ckpts/t2mem_smoke_stage2/2`的params及train_state均完成保存，`stage_updates={'stage1': 0, 'stage2a': 1, 'stage2b': 1}`、`complete=True`。这验证了32帧截断配置的交替更新和保存；两阶段使用不同samples，不能由这两个loss判断收敛。完整episode Stage2B训练显存和真实resume仍待验证；随后推理与simulator结果见第9节。
+
+正式20,000步Stage1前，先做最长训练episode的完整前缀Stage2诊断，避免正式A训练完才发现B显存不可行。临时manifest只保留该训练episode，normalization仍使用原100个episodes的统计；临时YAML继承smoke，将`max_sequence_length`设为`null`、`truncate_prefix`设为`false`，保持两阶段各一次更新、effective batch=1和完整跨时间梯度。最长长度按当前loader计算为`len(range(0, execution_start, 16)) + steps - execution_start`，并补齐到下一2的幂。从已完成的Stage1 smoke `/1`初始化，使用独立`runs/ckpts/t2mem_fullprefix_probe`目录；运行前停止policy server。这仅检验该长度两种更新的运行情况，不是正式B，也未覆盖accumulation32的梯度缓冲和多个长度bucket的编译cache。
+
+2026-10-12用户完整前缀记录：最长`episode_27`为1025帧、2048 padding bucket。`step=1, stage=stage2a`，loss=`38.38266372680664`、gradient norm=`1.2223113775253296`、supervised frames=1025、scheduled memory writes=65、`approximations=[]`，完成真实优化更新。随后写`runs/ckpts/t2mem_fullprefix_probe/1/params`失败，TensorStore报告`OS error 28: ENOSPC No space left on device`。该step没有完整metadata提交，不能resume；进程退出后需要从A1重跑，使用新的空run root（如`runs/ckpts/t2mem_fullprefix_probe_retry`）。Stage2B及真实resume尚未验证。
+
+用户随后提供的`df -h`确认：`/data1`容量14T、使用100%、可用246M；`/data0`可用9.5T。后续checkpoint应保存到用户在`/data0`上的可写目录，通过`--checkpoint-dir`覆盖；数据、norm stats和A1仍可从原位置读取。`/`只有13G可用，不适合本次两阶段完整probe。尚未提供`/data0`的具体用户目录，不能假定该挂载根目录可写。
+
 分别运行 A 和 B 的 smoke：
 
 ```bash
@@ -154,6 +164,8 @@ bash scripts/t2mem/train_stage1.sh --checkpoint-dir runs/ckpts/pickxtimes_stage1
 ```
 
 默认20,000 optimizer updates，LR2e-5，microbatch1×accumulation64=effective batch64 frames。base VLM 和 vision encoder frozen，VLM LoRA、完整 AE、action/time projections trainable；不运行 memory，新增 continuous state_proj 也 frozen。Stage 1 以单 execution frame 和带 mask 的 H64 future actions 训练。
+
+新启动的A100配置设置`training.keep_last_checkpoints: 2`。新快照的params、train_state、norm stats及metadata全部保存成功后，才清理当前run中超出保留数量的旧完整数字目录；初始化来源额外受保护，未完成目录及symlink不参与清理。设为`null`保留全部；缺少该字段的旧metadata也默认保留全部。清理失败仅记录warning，已提交的新快照仍然可用。按此前Stage1 smoke约13GiB/快照估计，保留两份时稳定占用约26GiB，写第三份期间约39GiB；仍需为写新快照预留空间，保留机制不能修复已经满盘的首次保存。
 
 保存 A checkpoint `runs/ckpts/pickxtimes_stage1/20000`，并用它初始化 B 和评估 A。不要用官方已发布的 RoboMME baseline替代自己训练的 A。若额外评估官方 baseline，请单独列为外部参考，其训练任务/预算与本实验不同。
 
@@ -183,6 +195,12 @@ CUDA_VISIBLE_DEVICES=6 uv run python scripts/t2mem/train.py --stage resume --res
 ```
 
 `--resume` 既可以指定完整 step directory，也可以指定 run root（取最后一个 metadata 已完整提交的 checkpoint）。恢复所有模型参数、阶段、cycle、phase/global step、每阶段 optimizer/scheduler counts、JAX RNG 和 host episode sampler RNG/counters。默认采用保存的 resolved config。A/B 是独立 run，因此 B 的 global step 从0起，A的来源/20,000步保留在 source metadata。中断时只恢复最后完整 snapshot，不声称恢复尚未保存的 microbatch。
+
+旧checkpoint的metadata若没有`keep_last_checkpoints`，恢复时仍保留全部，传入新`--config`不会覆盖saved config的保留设置。新增保留机制的配置兼容、三次真实小模型保存、初始化来源/未完成目录/symlink保护，以及保存失败时不清理旧快照等回归尚未在服务器执行；同步本地改动后运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src uv run --no-sync pytest -q tests/test_t2mem_training.py -k checkpoint_retention
+```
 
 恢复时使用该snapshot的`assets/robomme/norm_stats.json`，避免原始data-preparation目录被移动或改写后导致模型与动作normalization不一致。
 
@@ -215,10 +233,14 @@ simulator 的 `gui_render=False` 只关闭GUI，不能等同于CPU simulation。
 
 ```bash
 # 终端1：GPU policy环境，保持运行
-bash scripts/t2mem/serve.sh runs/ckpts/t2mem_smoke_stage2/2 --ablation full --port 8000
+CUDA_VISIBLE_DEVICES=6 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 bash scripts/t2mem/serve.sh runs/ckpts/t2mem_smoke_stage2/2 --ablation full --port 8000
 # 终端2：simulator环境，仅两个episodes，一个seed
 CUDA_VISIBLE_DEVICES=6 .venv-robomme/bin/python examples/robomme/eval.py --t2mem --tasks PickXtimes --episodes-per-task 2 --seeds 7 --port 8000 --save-dir runs/evaluation/pickxtimes_smoke
 ```
+
+等待终端1开始监听8000端口后再运行终端2。serve wrapper保留已有环境变量，因此这里显式覆盖训练时export的memory fraction 0.90。首个推理请求还会JIT编译。此smoke检查checkpoint加载和rollout链路；仅经过三次总优化更新的模型不能用于性能结论。完成后检查`metrics.json`中的`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`。
+
+2026-10-12用户推理/仿真smoke记录：seed7、episode0/1均为easy，均达到步数上限，记录为`timeout`；`expected_rollouts=2`、`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`，successes=0。该结果验证了checkpoint推理加载、policy/simulator通信及两个完整rollout。`complete`表示评估预算完成，timeout属于有效任务失败；训练仅Stage1一次和Stage2A/2B各一次更新，0/2不能用作正式A/B/C性能结论。`pynvml`的FutureWarning是依赖弃用提示，此次运行没有因此失败。
 
 正式A，先关闭其他server：
 
@@ -261,6 +283,8 @@ No-write保留learned W0、reads、全部slow参数及正常sampling RNG cadence
 
 ## 10. OOM与最可能的运行时问题
 
+遇到`ENOSPC`先检查目标文件系统的`df -h .`及`df -i .`；磁盘容量、inode或配额问题不能按GPU显存问题处理。仅清理本次未完成且没有`metadata.json`的probe step，保留原metrics和resolved config；旧run root仍非空，重试使用新的空目录。按已保存smoke的实际量估计，两阶段probe快照合计约22–23GiB，建议目标盘先有30GiB可用。改变`save_interval`不会跳过phase边界保存。正式训练还需要控制checkpoint保留数量；新快照保存成功前，磁盘必须同时容纳旧快照和正在写的新快照。
+
 完整长episode的二阶meta-gradient计算图，即使remat、BF16、microbatch1也可能超过80GB；本实现不能在未实测时声称已解决。先检查microbatch=1、num_devices=1、唯一GPU6、remat=true以及simulator/其他server已停止。减少accumulation次数不会减少单sequence的peak memory，只会改变effective batch。各长度按下一2的幂padding/bucketing，首次遇到新bucket会JIT compile；长episode和每帧监督可能引起compile耗时与cache增长。
 
 先尝试调整`model.temporal_remat_block_size`，它保留跨时间完整梯度，不构成approximation。增加block size可能减少边界state存储，同时增加block重计算开销；真实最优值与OOM边界仍须A100测量。
@@ -279,4 +303,4 @@ git diff --check
 for script in scripts/t2mem/*.sh; do bash -n "$script"; done
 ```
 
-新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器四种等价性用例全部通过；实际PickXtimes数据准备、π0.5-base恢复、Stage1一次GPU优化更新和checkpoint保存也已完成。Stage2、正式长序列训练、完整resume round-trip、policy inference、simulator rollout和success rates仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
+新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器四种等价性用例全部通过；实际PickXtimes数据准备、π0.5-base恢复、Stage1一次GPU优化更新，以及32帧截断Stage2A/2B各一次更新和checkpoint保存也已完成。该Stage2 checkpoint的推理/仿真smoke完成两个有效rollout，均timeout、基础设施错误为0。最长1025帧完整前缀Stage2A更新也已完成，但首次保存遇到ENOSPC，Stage2B未执行。正式长序列训练、完整resume round-trip及150-rollout A/B/C性能评估仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。

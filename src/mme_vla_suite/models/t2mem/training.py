@@ -140,6 +140,66 @@ def latest_checkpoint(path: str | Path) -> Path:
     return max(candidates, key=lambda p: int(p.name))
 
 
+def _prune_checkpoints(run_root: Path, keep_last: int | None, *, current_checkpoint: Path,
+                       initialization_source: str | None = None) -> None:
+    """Remove old committed snapshots from this run only, after a new commit.
+
+    Failed saves, unrelated directories and symlinks are never candidates.
+    An initialization checkpoint inside this run remains protected even when
+    it is older than the requested retention window.
+    """
+    if keep_last is None:
+        return
+    root = run_root.expanduser().resolve()
+    current = current_checkpoint.expanduser().resolve()
+    source = Path(initialization_source).expanduser().resolve() if initialization_source else None
+
+    def committed_step(path: Path) -> int | None:
+        if path.parent != root or path.is_symlink() or not path.is_dir() or not re.fullmatch(r"[0-9]+", path.name):
+            return None
+        marker = path / "metadata.json"
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        try:
+            metadata = json.loads(marker.read_text())
+        except OSError:
+            logging.warning("Cannot inspect checkpoint for retention: %s", path, exc_info=True)
+            return None
+        except (ValueError, UnicodeError):
+            return None
+        if not isinstance(metadata, dict) or type(metadata.get("format_version")) is not int:
+            return None
+        progress = metadata.get("progress")
+        if metadata["format_version"] != 1 or metadata.get("complete") is not True or not isinstance(progress, dict):
+            return None
+        step = progress.get("global_step")
+        if type(step) is not int or step != int(path.name):
+            return None
+        if any((path / part).is_symlink() or not (path / part).is_dir() for part in ("params", "train_state")):
+            return None
+        return step
+
+    completed = []
+    for path in root.iterdir():
+        step = committed_step(path)
+        if step is not None:
+            completed.append((step, path))
+    completed.sort(key=lambda item: item[0])
+    for step, path in completed[:-keep_last]:
+        if path == current or (source is not None and (source == path or source.is_relative_to(path))):
+            continue
+        # Recheck before removing anything; do not follow a replaced symlink or
+        # prune a directory whose committed marker changed during inspection.
+        if committed_step(path) != step:
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logging.warning("Checkpoint saved, but retention could not remove %s", path, exc_info=True)
+        else:
+            logging.info("Removed old checkpoint after successful save: %s", path)
+
+
 def load_initial_parameters(model: Any, path: str | Path, *, fresh_memory: bool,
                             allow_new_policy_parameters: bool = False) -> None:
     """Load pretrained/Stage-1 policy while leaving genuinely new memory fresh."""
@@ -301,6 +361,13 @@ class Trainer:
         temporary = destination / "metadata.json.tmp"
         temporary.write_text(json.dumps(metadata, indent=2) + "\n")
         temporary.rename(destination / "metadata.json")
+        try:
+            _prune_checkpoints(destination.parent, self.config.training.keep_last_checkpoints,
+                               current_checkpoint=destination, initialization_source=self.config.initialization_source)
+        except Exception:
+            # A committed checkpoint remains usable even if listing/removing
+            # older snapshots fails. Make storage failures visible in the log.
+            logging.warning("Checkpoint saved, but retention failed under %s", destination.parent, exc_info=True)
         return destination
 
     def restore(self, path: str | Path) -> None:

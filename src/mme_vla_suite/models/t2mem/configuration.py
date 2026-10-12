@@ -46,6 +46,8 @@ class TrainingSettings:
     outer_gradient_clip: float = 1.0
     save_interval: int = 100
     log_interval: int = 1
+    # None preserves the original keep-all behavior, including old metadata.
+    keep_last_checkpoints: int | None = None
 
 
 @dataclass
@@ -99,6 +101,9 @@ class RunConfig:
                 raise ValueError(f"training.{name} must be positive")
         if values.alternating_cycles is not None and values.alternating_cycles <= 0:
             raise ValueError("alternating_cycles must be positive")
+        keep = values.keep_last_checkpoints
+        if keep is not None and (type(keep) is not int or keep <= 0):
+            raise ValueError("training.keep_last_checkpoints must be None or a positive integer")
         if self.data.max_sequence_length is not None and not self.data.truncate_prefix:
             raise ValueError("max_sequence_length requires explicit truncate_prefix=true")
         block_size = self.model.get("temporal_remat_block_size", 16)
