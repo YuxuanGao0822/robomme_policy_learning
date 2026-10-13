@@ -2,9 +2,9 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：用户 A100 已完成数据准备、Stage 1/2训练smoke及推理/仿真smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。Stage 2从该checkpoint初始化，2A/2B各完成一次更新，每次32个observations、2次memory writes，最终checkpoint `runs/ckpts/t2mem_smoke_stage2/2`保存完成。该checkpoint的seed7、两个easy test episodes均完成rollout，状态为timeout：`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`；短训练的0/2不是正式性能结果。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。正式长序列训练、完整resume round-trip及150-rollout A/B/C评估仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 已完成数据准备、Stage 1/2训练smoke、完整前缀交替训练和真实恢复续训，以及推理/仿真smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。Stage 2从该checkpoint初始化，2A/2B各完成一次更新，每次32个observations、2次memory writes，最终checkpoint `runs/ckpts/t2mem_smoke_stage2/2`保存完成。该checkpoint的seed7、两个easy test episodes均完成rollout，状态为timeout：`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`；短训练的0/2不是正式性能结果。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。正式训练预算及150-rollout A/B/C评估仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
 
-完整前缀诊断已启动：最长`episode_27`有1025个observations，padding到2048；Stage2A完成一次更新、65次writes、finite loss/gradient，`approximations=[]`。随后首次checkpoint保存遇到`ENOSPC / No space left on device`，训练退出；该1025帧Stage2B尚未执行，整轮诊断未完成，不能把这次磁盘错误描述为GPU OOM或完整训练通过。
+当前工作账号为`gaoyuxuan2`，仓库和缓存位于`/data0/workspace/gaoyuxuan2`。2026-10-13重新下载官方权重后，Stage1 smoke已完成并保存`runs/ckpts/t2mem_smoke_stage1/1`。从这个新checkpoint初始化的完整前缀诊断也已通过：1025个observations、2048 padding bucket，Stage2A/2B各一次更新、各65次scheduled writes，loss/gradient有限、`approximations=[]`；`runs/ckpts/t2mem_fullprefix_probe/2`完成保存，最终`complete=True`。随后从`/2`实际恢复params和train_state，将总预算扩至2cycles，step3/4继续完成2A/2B，最终`runs/ckpts/t2mem_fullprefix_resume/4`保存成功、`complete=True`。旧账号`/data1`的首次完整前缀保存曾因ENOSPC退出；本次`/data0`运行及续训均完成两个阶段。完整前缀诊断仍为effective batch1，正式batch32及多长度长期训练尚待验证；上述32帧Stage2和两个rollout结果来自旧账号。
 
 ## 1. 同步与环境安装
 
@@ -88,7 +88,7 @@ data/t2mem/assets/robomme/norm_stats.json
 
 准备流程只打开明确命名的PickXtimes HDF5，使用其`episode_N/timestep_N`的真实连续时间线和`info/is_video_demo`分段，不依赖旧pickle中不存在的task-name字段。language instruction兼容官方HDF5的variable-length UTF-8字符串。不读取subgoal、抓取计数或success/task-progress来形成memory。显式held-out文件路径及HDF5 split metadata被拒绝；文件名本身不能证明数据来源，因此manifest记录操作者提供的官方training-release来源声明。
 
-π0.5-base从GCS下载，`HF_ENDPOINT`只影响HF数据下载。GCS后台传输异常现在会向调用者抛出，失败的`.partial`文件不会升级成已完成cache；不要把传输失败当作checkpoint下载成功。本轮新增的文件名兼容及下载失败/retry回归测试尚未在服务器执行，可单独运行：
+π0.5-base从GCS下载，`HF_ENDPOINT`只影响HF数据下载。新传输会在缓存提交前核对远端相对文件清单及每个文件字节数，后台异常或正常返回但截断的文件均不会升级成已完成cache；重试会清理旧`.partial`。官方脚本使用匿名GCS和size检查，并验证已有cache；损坏缓存会报错，显式使用`uv run python scripts/download_pi05_base.py --force`可重建。这些检查可以识别缺失、额外或长度错误的文件，不提供同长度内容的checksum验证。下载完整性回归共14个无网络用例，目前只完成静态检查，尚未在服务器执行，可单独运行：
 
 ```bash
 PYTHONPATH=src uv run pytest -q tests/test_t2mem_training.py tests/test_t2mem_download.py
@@ -140,13 +140,25 @@ PYTHONPATH=src uv run pytest -q tests/test_t2mem*.py
 
 Stage2 smoke窗口已从8改为32。长执行episode的32帧尾窗口包含两个stride16写入，且第一个写入后有监督读取；原8帧可能没有写入，或唯一写入在最后一帧。它仍是从窗口W0开始的截断近似，不能代表full-episode显存表现。该data设置不改变model架构或normalization，可直接复用上述Stage1/1 checkpoint。
 
-2026-10-12用户Stage2 smoke记录：从上述Stage1/1恢复参数，`step=1, stage=stage2a`的loss=`10.479398727416992`、gradient norm=`1.6982085704803467`；`step=2, stage=stage2b`的loss=`9.98141860961914`、gradient norm=`47.425445556640625`。两个阶段均为effective batch=1、sequence length=32、supervised frames=32、scheduled memory writes=2。最终`runs/ckpts/t2mem_smoke_stage2/2`的params及train_state均完成保存，`stage_updates={'stage1': 0, 'stage2a': 1, 'stage2b': 1}`、`complete=True`。这验证了32帧截断配置的交替更新和保存；两阶段使用不同samples，不能由这两个loss判断收敛。完整episode Stage2B训练显存和真实resume仍待验证；随后推理与simulator结果见第9节。
+2026-10-12用户Stage2 smoke记录：从上述Stage1/1恢复参数，`step=1, stage=stage2a`的loss=`10.479398727416992`、gradient norm=`1.6982085704803467`；`step=2, stage=stage2b`的loss=`9.98141860961914`、gradient norm=`47.425445556640625`。两个阶段均为effective batch=1、sequence length=32、supervised frames=32、scheduled memory writes=2。最终`runs/ckpts/t2mem_smoke_stage2/2`的params及train_state均完成保存，`stage_updates={'stage1': 0, 'stage2a': 1, 'stage2b': 1}`、`complete=True`。这验证了32帧截断配置的交替更新和保存；两阶段使用不同samples，不能由这两个loss判断收敛。完整episode诊断结果见下面2026-10-13记录，推理与simulator结果见第9节。
 
 正式20,000步Stage1前，先做最长训练episode的完整前缀Stage2诊断，避免正式A训练完才发现B显存不可行。临时manifest只保留该训练episode，normalization仍使用原100个episodes的统计；临时YAML继承smoke，将`max_sequence_length`设为`null`、`truncate_prefix`设为`false`，保持两阶段各一次更新、effective batch=1和完整跨时间梯度。最长长度按当前loader计算为`len(range(0, execution_start, 16)) + steps - execution_start`，并补齐到下一2的幂。从已完成的Stage1 smoke `/1`初始化，使用独立`runs/ckpts/t2mem_fullprefix_probe`目录；运行前停止policy server。这仅检验该长度两种更新的运行情况，不是正式B，也未覆盖accumulation32的梯度缓冲和多个长度bucket的编译cache。
 
-2026-10-12用户完整前缀记录：最长`episode_27`为1025帧、2048 padding bucket。`step=1, stage=stage2a`，loss=`38.38266372680664`、gradient norm=`1.2223113775253296`、supervised frames=1025、scheduled memory writes=65、`approximations=[]`，完成真实优化更新。随后写`runs/ckpts/t2mem_fullprefix_probe/1/params`失败，TensorStore报告`OS error 28: ENOSPC No space left on device`。该step没有完整metadata提交，不能resume；进程退出后需要从A1重跑，使用新的空run root（如`runs/ckpts/t2mem_fullprefix_probe_retry`）。Stage2B及真实resume尚未验证。
+2026-10-12用户完整前缀记录：最长`episode_27`为1025帧、2048 padding bucket。`step=1, stage=stage2a`，loss=`38.38266372680664`、gradient norm=`1.2223113775253296`、supervised frames=1025、scheduled memory writes=65、`approximations=[]`，完成真实优化更新。随后写`runs/ckpts/t2mem_fullprefix_probe/1/params`失败，TensorStore报告`OS error 28: ENOSPC No space left on device`。该step没有完整metadata提交，不能resume；进程退出后需要从A1重跑，使用新的空run root（如`runs/ckpts/t2mem_fullprefix_probe_retry`）。该次运行没有进入Stage2B。
 
-用户随后提供的`df -h`确认：`/data1`容量14T、使用100%、可用246M；`/data0`可用9.5T。后续checkpoint应保存到用户在`/data0`上的可写目录，通过`--checkpoint-dir`覆盖；数据、norm stats和A1仍可从原位置读取。`/`只有13G可用，不适合本次两阶段完整probe。尚未提供`/data0`的具体用户目录，不能假定该挂载根目录可写。
+用户随后提供的`df -h`确认：`/data1`容量14T、使用100%、可用246M；`/data0`可用9.5T。后续checkpoint应保存到用户在`/data0`上的可写目录，通过`--checkpoint-dir`覆盖。`/`只有13G可用，不适合本次两阶段完整probe。旧账号的数据、norm stats和A1可在新账号具备读取权限时迁移。
+
+用户随后使用新账号`gaoyuxuan2`，工作目录为`/data0/workspace/gaoyuxuan2/robomme_policy_learning`。训练环境及仿真环境完成安装；ManiSkill的HTTPS Git fetch曾遇到`GnuTLS recv error (-110)`，续装改用SSH传输同一固定commit，并用`--no-sources`避免benchmark的HTTPS来源配置覆盖显式SSH依赖。2026-10-12实际检查：Python3.11.17、JAX显示`[CudaDevice(id=0)]`、Torch=`2.9.1+cu128`且`CUDA: True`，simulator `uv pip check`检查114个包、全部兼容。新账号checkpoint保留机制测试为`7 passed, 11 deselected`（12.25s）；新账号渲染rollout仍待执行。
+
+迁移数据时，复制官方PickXtimes HDF5及原`data/t2mem`，将manifest的`raw_root`和每个`episodes[].path`同步到新目录；保持norm stats原字节，以满足A→B的SHA256检查。完整Stage1 smoke checkpoint复制到新目录后用于fresh `--init-checkpoint`，其metadata保留原训练来源，模型参数不因迁移改变。最长episode的诊断manifest/YAML应在新账号的`$TMPDIR`重新生成；不要复用旧账号的固定`/tmp/t2mem_fullprefix_probe.*`，其中可能仍有旧路径且文件归旧账号所有。
+
+实际迁移在源HDF5读取检查时遇到`PermissionError`，尚未创建复制目标或开始大文件复制。用户选择在新账号重新下载官方π0.5-base和PickXtimes release，重新准备manifest/norm stats，并从官方base重建Stage1 smoke `/1`。新账号已通过下面的Stage1运行；本次日志未报告重新索引的episode数量。后续诊断使用新账号的A1及其匹配normalization。
+
+新账号2026-10-12 23:59的Stage1尝试在恢复官方参数时失败，尚未进行优化更新或生成A1：TensorStore报告OCDBT的byte range结束于3,077,149,148，但本地对象仅924,755,640字节。官方GCS对象`checkpoints/pi05_base/params/ocdbt.process_0/d/8c5d7070ea57bdce2f0a19f95b8a21b4`的size确为3,077,149,148，确认本地分片被截断；再次运行普通下载脚本命中已有缓存而立即返回，并未重新下载。用户授权删除该`pi05_base`及同级`.partial`缓存后重下。临时恢复命令通过现有Google Cloud Storage SDK匿名下载到`.partial`，逐文件检查官方size和CRC32C后才提交缓存；不删除训练数据或run目录。
+
+2026-10-13新账号Stage1重试成功：官方参数12.5GiB在7.02s内完成恢复，`step=1, stage=stage1`，loss=`6.28102970123291`、gradient norm=`20.793720245361328`、effective batch=1、supervised frames=1、scheduled memory writes=0。params约8.1GiB、train_state约4.9GiB分别保存完成，最终`runs/ckpts/t2mem_smoke_stage1/1`提交成功，`stage_updates={'stage1': 1, 'stage2a': 0, 'stage2b': 0}`、`complete=True`。截断分片造成的本次restore故障已解除。
+
+2026-10-13新账号完整前缀诊断成功：从新A1恢复后，Stage2A的loss=`38.38225555419922`、gradient norm=`1.223090410232544`；Stage2B的loss=`37.77621078491211`、gradient norm=`49.83652114868164`。两个阶段均effective batch=1、sequence length=1025、supervised frames=1025、scheduled memory writes=65，配置为`max_sequence_length=null`、`truncate_prefix=false`、`detach_fast_state=false`，日志`approximations=[]`。两个step的params和train_state均finalize并提交，最终`runs/ckpts/t2mem_fullprefix_probe/2`保存成功，`global_step=2`、`stage_updates={'stage1': 0, 'stage2a': 1, 'stage2b': 1}`、`complete=True`。整个进程约28分56秒，包含首次编译及保存；两次params保存分别111.32s和259.11s，不能将该耗时直接当作稳定更新吞吐。这验证了单条最长序列的一轮完整交替运行，尚未验证正式accumulation32、多长度编译cache或长期训练；随后实际resume结果见第7节。
 
 分别运行 A 和 B 的 smoke：
 
@@ -164,6 +176,8 @@ bash scripts/t2mem/train_stage1.sh --checkpoint-dir runs/ckpts/pickxtimes_stage1
 ```
 
 默认20,000 optimizer updates，LR2e-5，microbatch1×accumulation64=effective batch64 frames。base VLM 和 vision encoder frozen，VLM LoRA、完整 AE、action/time projections trainable；不运行 memory，新增 continuous state_proj 也 frozen。Stage 1 以单 execution frame 和带 mask 的 H64 future actions 训练。
+
+当前完整前缀及真实resume诊断均已通过，下一步启动这个正式A预算。使用`configs/t2mem/t2mem_a100_80gb.yaml`，读取原`data/t2mem/manifest.json`，从官方`pi05_base/params`重新初始化；不载入smoke权重或临时单episode manifest。首条更新预期`stage=stage1`、`effective_batch=64`、`sequence_length_max=1`、`scheduled_memory_writes=0`、`approximations=[]`。正式A尚待服务器执行。
 
 新启动的A100配置设置`training.keep_last_checkpoints: 2`。新快照的params、train_state、norm stats及metadata全部保存成功后，才清理当前run中超出保留数量的旧完整数字目录；初始化来源额外受保护，未完成目录及symlink不参与清理。设为`null`保留全部；缺少该字段的旧metadata也默认保留全部。清理失败仅记录warning，已提交的新快照仍然可用。按此前Stage1 smoke约13GiB/快照估计，保留两份时稳定占用约26GiB，写第三份期间约39GiB；仍需为写新快照预留空间，保留机制不能修复已经满盘的首次保存。
 
@@ -196,7 +210,7 @@ CUDA_VISIBLE_DEVICES=6 uv run python scripts/t2mem/train.py --stage resume --res
 
 `--resume` 既可以指定完整 step directory，也可以指定 run root（取最后一个 metadata 已完整提交的 checkpoint）。恢复所有模型参数、阶段、cycle、phase/global step、每阶段 optimizer/scheduler counts、JAX RNG 和 host episode sampler RNG/counters。默认采用保存的 resolved config。A/B 是独立 run，因此 B 的 global step 从0起，A的来源/20,000步保留在 source metadata。中断时只恢复最后完整 snapshot，不声称恢复尚未保存的 microbatch。
 
-旧checkpoint的metadata若没有`keep_last_checkpoints`，恢复时仍保留全部，传入新`--config`不会覆盖saved config的保留设置。新增保留机制的配置兼容、三次真实小模型保存、初始化来源/未完成目录/symlink保护，以及保存失败时不清理旧快照等回归尚未在服务器执行；同步本地改动后运行：
+旧checkpoint的metadata若没有`keep_last_checkpoints`，恢复时仍保留全部，传入新`--config`不会覆盖saved config的保留设置。新增保留机制的配置兼容、三次真实小模型保存、初始化来源/未完成目录/symlink保护，以及保存失败时不清理旧快照等回归已在新账号服务器通过：`7 passed, 11 deselected`（12.25s）。对应命令：
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src uv run --no-sync pytest -q tests/test_t2mem_training.py -k checkpoint_retention
@@ -205,6 +219,17 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src uv run --no-sync pytest -q tests/test_t2me
 恢复时使用该snapshot的`assets/robomme/norm_stats.json`，避免原始data-preparation目录被移动或改写后导致模型与动作normalization不一致。
 
 如明确增加alternating总预算，可在resume命令加`--cycles 6`。已完成4cycles的run将从第5cycle的Stage2A继续，保持optimizer/RNG/source及step计数；不能把预算缩小到已完成或正在进行的cycle以下。未传`--cycles`时严格恢复原有预算。
+
+当前完整前缀probe已完成1cycle，用户随后从其`/2`进行了真实resume诊断。使用新的output root保留原`/2`，`--cycles 2`表示总预算扩至2cycles，只新增step3的Stage2A和step4的Stage2B，最终每阶段累计2次更新、`complete=True`。采用`/2`保存的resolved config及norm stats，无需重新传入临时YAML；该配置引用的`$TMPDIR/t2mem_fullprefix_probe_manifest.json`及原HDF5仍须存在。2026-10-13用户已完成以下命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
+  uv run --no-sync python scripts/t2mem/train.py \
+  --stage resume --resume runs/ckpts/t2mem_fullprefix_probe/2 \
+  --checkpoint-dir runs/ckpts/t2mem_fullprefix_resume --cycles 2
+```
+
+实际日志显示`probe/2/params`约8.1GiB在4.48s内恢复，`probe/2/train_state`约5.4GiB在2.59s内恢复；随后step3、cycle1、Stage2A的loss=`32.75070571899414`、gradient norm=`0.4629075825214386`，step4、cycle1、Stage2B的loss=`32.57140350341797`、gradient norm=`38.39067840576172`。两阶段仍为1025 observations、65次scheduled writes、effective batch1、`approximations=[]`。PickXtimes sampler更新/采样计数连续为3和4，新`/3`、`/4`的params及train_state均finalize并提交；最终`global_step=4`、`stage_updates={'stage1': 0, 'stage2a': 2, 'stage2b': 2}`、`complete=True`。这验证了真实模型与训练状态载入、阶段/计数继续、优化更新及再保存；尚未与不中断四步运行逐位比较，也不能凭两步loss判断收敛或闭环能力。
 
 ```text
 runs/ckpts/<run>/resolved_config.json
@@ -215,7 +240,7 @@ runs/ckpts/<run>/<global_step>/metadata.json       # config/provenance/phase/sam
 runs/ckpts/<run>/<global_step>/assets/robomme/norm_stats.json
 ```
 
-每条训练日志记录loss、gradient norm、effective batch、task sampling counts、sequence length mean/max、valid supervision frames、scheduled writes、approximation标签。参数 ownership 及各组 scalar count 在启动时输出。写 checkpoint 前同步 device→CPU；不会在下一次训练同时保留异步 GPU snapshot，但需要容纳模型/optimizer snapshot 的 CPU RAM/磁盘。所有 checkpoint 当前保留，完整 runs 的磁盘开销较大，可在确认 final checkpoint 后手动归档旧 snapshots。
+每条训练日志记录loss、gradient norm、effective batch、task sampling counts、sequence length mean/max、valid supervision frames、scheduled writes、approximation标签。参数 ownership 及各组 scalar count 在启动时输出。写 checkpoint 前同步 device→CPU；不会在下一次训练同时保留异步 GPU snapshot，但需要容纳模型/optimizer snapshot 的 CPU RAM/磁盘。A100及smoke配置在新完整快照提交后保留最近两份，初始化来源额外受保护；旧metadata缺少该设置时仍保留全部。
 
 ## 8. 单 A100 的 policy/simulator 资源
 
@@ -303,4 +328,4 @@ git diff --check
 for script in scripts/t2mem/*.sh; do bash -n "$script"; done
 ```
 
-新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器四种等价性用例全部通过；实际PickXtimes数据准备、π0.5-base恢复、Stage1一次GPU优化更新，以及32帧截断Stage2A/2B各一次更新和checkpoint保存也已完成。该Stage2 checkpoint的推理/仿真smoke完成两个有效rollout，均timeout、基础设施错误为0。最长1025帧完整前缀Stage2A更新也已完成，但首次保存遇到ENOSPC，Stage2B未执行。正式长序列训练、完整resume round-trip及150-rollout A/B/C性能评估仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
+新增文件也进行了AST/语法和接口静态审查。本地没有执行JAX tests。用户服务器四种等价性用例全部通过；实际PickXtimes数据准备、π0.5-base恢复、Stage1一次GPU优化更新，以及32帧截断Stage2A/2B各一次更新和checkpoint保存也已完成。该Stage2 checkpoint的推理/仿真smoke完成两个有效rollout，均timeout、基础设施错误为0。2026-10-13新账号也已完成Stage1 smoke，以及最长1025帧完整前缀Stage2A/2B各一次更新和完整保存；之后从该`/2`实际恢复并完成step3/4，累计两轮交替，`approximations=[]`、`complete=True`。正式训练预算、多长度batch32训练及150-rollout A/B/C性能评估仍为**NOT RUN — requires Linux A100**，等待用户按上面的服务器命令验证。
