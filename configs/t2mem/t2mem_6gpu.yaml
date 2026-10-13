@@ -1,0 +1,15 @@
+# Six GPUs (physical 1–6), one process, synchronous data parallelism.
+# Start after the user has stopped the earlier single-device process on GPU 6.
+# Global batch remains A64 frames / B32 sequences, including masked DP tails.
+extends: t2mem_a100_80gb.yaml
+name: pickxtimes_stage1_6gpu
+gpu_id: 1
+num_devices: 6
+seed: 7
+checkpoint_dir: runs/ckpts/pickxtimes_stage1_6gpu
+training:
+  micro_batch_size: 1
+  stage1_accumulation_steps: 64
+  stage2_accumulation_steps: 32
+  save_interval: 5000
+  keep_last_checkpoints: 2

@@ -1,4 +1,4 @@
-"""Single-GPU, differentiable sequence training with independent phase optimizers.
+"""Differentiable sequence training with independent phase optimizers.
 
 Freezing selects optimizer inputs; it never detaches AE activations or fast
 states. The integrated model owns the chronological scan and read-before-write
@@ -28,6 +28,10 @@ from openpi.shared import normalize
 from .configuration import RunConfig
 from .dataset import EpisodeSampler, collate_sequences
 from .observation import T2Observation
+from .parallel import (
+    DATA_AXIS, collate_parallel_wave, make_gradient_reducer, make_mesh,
+    make_parallel_accumulator, make_parallel_grad, wave_sizes,
+)
 
 STAGES = ("stage1", "stage2a", "stage2b")
 
@@ -236,14 +240,36 @@ def load_initial_parameters(model: Any, path: str | Path, *, fresh_memory: bool,
 class Trainer:
     def __init__(self, model: Any, config: RunConfig, progress: PhaseProgress, sampler: EpisodeSampler):
         self.config, self.progress, self.sampler = config, progress, sampler
+        # Lazy for step-only trainers. Once loaded these exact bytes survive
+        # retention deleting the checkpoint from which this run was resumed.
+        self._norm_stats_bytes: bytes | None = None
         self.graphdef, self.state = nnx.split(model)
         self.rng = jax.random.PRNGKey(config.seed + 1)
+        self.mesh = make_mesh(config.num_devices) if config.num_devices > 1 else None
+        self.replica_sharding = None
+        self.slot_sharding = None
+        if self.mesh is not None:
+            if config.training.micro_batch_size != 1:
+                raise ValueError("Data-parallel training requires micro_batch_size=1 per device")
+            self.replica_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            self.slot_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(DATA_AXIS))
+            self.state = self._put_replicated(self.state)
+            self.rng = self._put_replicated(self.rng)
+            self.parallel_accumulate = make_parallel_accumulator(self.mesh)
+            self.reduce_gradients = make_gradient_reducer(self.mesh)
+            self.split_rng = jax.jit(jax.random.split, in_shardings=self.replica_sharding,
+                                    out_shardings=self.replica_sharding)
         self.optimizers: dict[str, Any] = {}
         self.optimizer_states: dict[str, Any] = {}
         self.grad_fns: dict[str, Any] = {}
         self.update_fns: dict[str, Any] = {}
         self.accumulate = jax.jit(lambda old, new: jax.tree.map(jnp.add, old, new))
         self.audit_groups()
+
+    def _put_replicated(self, tree: Any) -> Any:
+        # Named replication keeps every logical leaf shape unchanged, so saved
+        # checkpoints remain readable by both single-device trainers and policy.
+        return jax.device_put(tree, self.replica_sharding) if self.replica_sharding is not None else jax.device_put(tree)
 
     def audit_groups(self) -> None:
         pure = self.state.filter(nnx.Param).to_pure_dict()
@@ -263,7 +289,7 @@ class Trainer:
         active = self.state.filter(active_filter).to_pure_dict()
         tx = optimizer_for(stage, active, self.config)
         self.optimizers[stage] = tx
-        self.optimizer_states[stage] = tx.init(active)
+        self.optimizer_states[stage] = self._put_replicated(tx.init(active))
 
         def loss_fn(train_params: dict, all_state: Any, rng: Any, batch: dict) -> Any:
             model = nnx.merge(self.graphdef, all_state)
@@ -276,22 +302,22 @@ class Trainer:
                                                batch["write_mask"], batch["observation_mask"],
                                                train=True, memory_enabled=stage != "stage1")
 
-        self.grad_fns[stage] = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
+        self.grad_fns[stage] = (make_parallel_grad(loss_fn, self.mesh) if self.mesh is not None
+                               else jax.jit(jax.value_and_grad(loss_fn, has_aux=True)))
 
         def apply(params: Any, gradients: Any, opt_state: Any) -> Any:
             updates, opt_state = tx.update(gradients, opt_state, params)
             return optax.apply_updates(params, updates), opt_state
 
-        self.update_fns[stage] = jax.jit(apply)
+        if self.mesh is not None:
+            self.update_fns[stage] = jax.jit(
+                apply, in_shardings=(self.replica_sharding,) * 3,
+                out_shardings=(self.replica_sharding,) * 2,
+            )
+        else:
+            self.update_fns[stage] = jax.jit(apply)
 
-    def step(self) -> dict:
-        stage = self.progress.phase
-        cycle, phase_step = self.progress.cycle, self.progress.phase_step
-        self.ensure_optimizer(stage)
-        active = self.state.filter(stage_filter(stage)).to_pure_dict()
-        accumulation = (self.config.training.stage1_accumulation_steps if stage == "stage1"
-                        else self.config.training.stage2_accumulation_steps)
-        task = self.sampler.next_task()
+    def _single_gradients(self, stage: str, active: dict, task: str, accumulation: int) -> tuple:
         gradients = None
         loss_sum = 0.0
         stats_sums: dict[str, float] = {}
@@ -314,8 +340,65 @@ class Trainer:
             # state and recurrent activations belong to this one value_and_grad.
             del batch, grads, loss, stats
         gradients = jax.tree.map(lambda value: value / accumulation, gradients)
+        return (gradients, loss_sum / accumulation,
+                {name: value / accumulation for name, value in stats_sums.items()},
+                sequence_lengths, supervised_frames, memory_writes, accumulation)
+
+    def _parallel_gradients(self, stage: str, active: dict, task: str, global_batch: int) -> tuple:
+        local_sums = None
+        sequence_lengths, supervised_frames, memory_writes = [], [], []
+        sizes = wave_sizes(global_batch, self.config.num_devices)
+        for size in sizes:
+            samples, keys = [], []
+            for _ in range(size):
+                sample = self.sampler.sample(task, stage1=stage == "stage1")
+                samples.append(sample)
+                # Consume exactly the original micro1 stream: one split per
+                # real episode, none for empty slots in the final wave.
+                self.rng, loss_rng = self.split_rng(self.rng)
+                keys.append(loss_rng)
+                sequence_lengths.append(int(sample.observation_mask.sum()))
+                supervised_frames.append(int(sample.action_mask.any(axis=(-2, -1)).sum()))
+                memory_writes.append(int(sample.write_mask.sum()))
+            batch, valid = collate_parallel_wave(samples, self.config.num_devices)
+            batch = jax.device_put(batch, self.slot_sharding)
+            valid = jax.device_put(valid, self.slot_sharding)
+            keys = jax.device_put(jnp.stack(keys + [keys[0]] * (self.config.num_devices - size)),
+                                  self.slot_sharding)
+            (loss, stats), grads = self.grad_fns[stage](active, self.state, keys, batch, valid)
+            wave = {"gradients": grads, "loss": loss, "stats": stats}
+            local_sums = wave if local_sums is None else self.parallel_accumulate(local_sums, wave)
+            # Dispatch is asynchronous. Finish this wave before loading another
+            # long prefix, so queued inputs/activations cannot grow with the
+            # number of accumulation waves. This adds no cross-device reduction.
+            jax.block_until_ready(local_sums)
+            # Retain only one gradient accumulator per device, with no recurrent
+            # graph or fast-state carry between independently sampled episodes.
+            del sample, samples, batch, valid, keys, grads, loss, stats, wave
+        # One collective over all waves, before clipping and a single AdamW
+        # update. Every real episode gets weight 1/global_batch, including tails.
+        reduced = self.reduce_gradients(local_sums, self._put_replicated(jnp.asarray(global_batch, jnp.float32)))
+        loss, stats = jax.device_get((reduced["loss"], reduced["stats"]))
+        return (reduced["gradients"], float(loss),
+                {name: float(np.asarray(value).mean()) for name, value in stats.items()},
+                sequence_lengths, supervised_frames, memory_writes, len(sizes))
+
+    def step(self) -> dict:
+        stage = self.progress.phase
+        cycle, phase_step = self.progress.cycle, self.progress.phase_step
+        self.ensure_optimizer(stage)
+        active = self.state.filter(stage_filter(stage)).to_pure_dict()
+        accumulation = (self.config.training.stage1_accumulation_steps if stage == "stage1"
+                        else self.config.training.stage2_accumulation_steps)
+        task = self.sampler.next_task()
+        effective_batch = accumulation * self.config.training.micro_batch_size
+        if self.mesh is None:
+            result = self._single_gradients(stage, active, task, accumulation)
+        else:
+            result = self._parallel_gradients(stage, active, task, effective_batch)
+        gradients, loss, stats, sequence_lengths, supervised_frames, memory_writes, waves = result
         gradient_norm = float(jax.device_get(optax.global_norm(gradients)))
-        if not np.isfinite(loss_sum) or not np.isfinite(gradient_norm):
+        if not np.isfinite(loss) or not np.isfinite(gradient_norm):
             raise FloatingPointError(f"Non-finite {stage} objective/gradient at step {self.progress.global_step}")
         new_params, new_opt_state = self.update_fns[stage](active, gradients, self.optimizer_states[stage])
         active_state = self.state.filter(stage_filter(stage))
@@ -326,13 +409,14 @@ class Trainer:
         self.optimizer_states[stage] = new_opt_state
         self.progress.advance(self.config)
         return {"step": self.progress.global_step, "stage": stage, "cycle": cycle, "phase_step": phase_step + 1,
-                "loss": loss_sum / accumulation, "gradient_norm": gradient_norm, "task": task,
-                "effective_batch": accumulation * self.config.training.micro_batch_size,
+                "loss": loss, "gradient_norm": gradient_norm, "task": task,
+                "effective_batch": effective_batch, "num_devices": self.config.num_devices,
+                "parallel_waves": waves,
                 "sequence_length_mean": float(np.mean(sequence_lengths)), "sequence_length_max": max(sequence_lengths),
                 "supervised_frames": sum(supervised_frames), "scheduled_memory_writes": sum(memory_writes),
                 "task_updates": dict(self.sampler.task_updates), "task_samples": dict(self.sampler.task_samples),
                 "approximations": self.config.approximation_labels(),
-                **{name: value / accumulation for name, value in stats_sums.items()}}
+                **stats}
 
     def save(self) -> Path:
         destination = Path(self.config.checkpoint_dir).expanduser().resolve() / str(self.progress.global_step)
@@ -340,6 +424,8 @@ class Trainer:
             if (destination / "metadata.json").is_file():
                 return destination
             shutil.rmtree(destination)
+        if self._norm_stats_bytes is None:
+            self._norm_stats_bytes = (Path(self.config.data.norm_stats_dir) / "norm_stats.json").read_bytes()
         destination.mkdir(parents=True)
         # Synchronous host snapshots avoid retaining an asynchronous duplicate
         # of GPU buffers while the next large recurrent graph executes.
@@ -351,7 +437,7 @@ class Trainer:
             checkpointer.save(destination / "train_state", args=ocp.args.PyTreeSave(train_state))
         assets = destination / "assets" / "robomme"
         assets.mkdir(parents=True)
-        shutil.copyfile(Path(self.config.data.norm_stats_dir) / "norm_stats.json", assets / "norm_stats.json")
+        (assets / "norm_stats.json").write_bytes(self._norm_stats_bytes)
         metadata = {"format_version": 1, "config": self.config.to_dict(), "progress": asdict(self.progress),
                     "sampler": self.sampler.state_dict(), "optimizer_stages": list(self.optimizer_states),
                     "initialization_source": self.config.initialization_source,
@@ -375,9 +461,12 @@ class Trainer:
         metadata = json.loads((path / "metadata.json").read_text())
         if metadata["config"]["model"] != self.config.model:
             raise ValueError("Resume model architecture must exactly match the saved configuration")
+        # Use the selected snapshot's immutable normalization, independently of
+        # preparation paths or an earlier source snapshot that retention prunes.
+        self._norm_stats_bytes = (path / "assets" / "robomme" / "norm_stats.json").read_bytes()
         model = nnx.merge(self.graphdef, self.state)
         load_initial_parameters(model, path, fresh_memory=False)
-        self.state = nnx.state(model)
+        self.state = self._put_replicated(nnx.state(model))
         # Restore may be called on an already-used Trainer. Only the optimizer
         # groups present in this snapshot belong to its saved PyTree structure.
         self.optimizers.clear()
@@ -390,13 +479,13 @@ class Trainer:
                   "model_variables": self.state.filter(nnx.Not(nnx.Param)).to_pure_dict()}
         with ocp.PyTreeCheckpointer() as checkpointer:
             restored = checkpointer.restore(path / "train_state", args=ocp.args.PyTreeRestore(item=target))
-        self.optimizer_states = jax.device_put(restored["optimizer_states"])
-        self.rng = jax.device_put(restored["rng"])
+        self.optimizer_states = self._put_replicated(restored["optimizer_states"])
+        self.rng = self._put_replicated(restored["rng"])
         variables = self.state.filter(nnx.Not(nnx.Param))
-        variables.replace_by_pure_dict(jax.device_put(restored["model_variables"]))
+        variables.replace_by_pure_dict(self._put_replicated(restored["model_variables"]))
         model = nnx.merge(self.graphdef, self.state)
         nnx.update(model, variables)
-        self.state = nnx.state(model)
+        self.state = self._put_replicated(nnx.state(model))
         self.progress = PhaseProgress(**metadata["progress"])
         self.sampler.load_state_dict(metadata["sampler"])
 

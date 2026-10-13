@@ -91,9 +91,13 @@ class RunConfig:
         return labels
 
     def validate(self) -> None:
-        if self.num_devices != 1:
-            raise ValueError("The T²Mem runner implements single-device training; num_devices must be 1")
+        if type(self.num_devices) is not int or self.num_devices <= 0:
+            raise ValueError("num_devices must be a positive integer")
+        if type(self.gpu_id) is not int or self.gpu_id < 0:
+            raise ValueError("gpu_id must be a nonnegative physical GPU index")
         values = self.training
+        if self.num_devices > 1 and (type(values.micro_batch_size) is not int or values.micro_batch_size != 1):
+            raise ValueError("Multi-device T²Mem training requires training.micro_batch_size=1 per episode")
         for name in ("micro_batch_size", "stage1_accumulation_steps", "stage2_accumulation_steps",
                      "stage1_updates", "memory_updates_per_cycle", "policy_updates_per_cycle",
                      "save_interval", "log_interval"):

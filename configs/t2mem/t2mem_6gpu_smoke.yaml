@@ -1,0 +1,19 @@
+# APPROXIMATION: short 32-observation prefixes restart from W0; global batch8
+# checks a full six-device group plus a masked two-episode tail. No model-size
+# reduction, gradient detachment, or first-order inner update is enabled.
+extends: t2mem_6gpu.yaml
+name: pickxtimes_6gpu_smoke
+checkpoint_dir: runs/ckpts/pickxtimes_6gpu_smoke
+data:
+  max_sequence_length: 32
+  truncate_prefix: true
+training:
+  micro_batch_size: 1
+  stage1_accumulation_steps: 8
+  stage2_accumulation_steps: 8
+  stage1_updates: 1
+  memory_updates_per_cycle: 1
+  policy_updates_per_cycle: 1
+  alternating_cycles: 1
+  # Each run's final snapshot is saved even before the periodic boundary.
+  save_interval: 5000
