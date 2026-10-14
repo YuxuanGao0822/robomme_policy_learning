@@ -264,6 +264,8 @@ uv run --no-sync python scripts/t2mem/train.py \
 
 ## 6. Experiment B：完整 alternating Stage 2
 
+需要等待当前六卡Stage1并后台自动完成Stage2和A/B/C正式评测时，使用[服务器后台流水线](t2mem_background_pipeline.md)。默认监控PID1776511、每10分钟检查，训练和评测成功后自动生成比较表。
+
 ```bash
 bash scripts/t2mem/train_stage2.sh --init-checkpoint runs/ckpts/pickxtimes_stage1/20000 --checkpoint-dir runs/ckpts/pickxtimes_t2mem --cycles 4
 ```
