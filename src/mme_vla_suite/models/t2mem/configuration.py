@@ -22,11 +22,16 @@ class DataSettings:
     task_weights: dict[str, float] | None = None
     max_sequence_length: int | None = None
     truncate_prefix: bool = False
+    # Cache only small expert-action timelines on the CPU, not images.
+    cache_actions: bool = False
 
 
 @dataclass
 class TrainingSettings:
     micro_batch_size: int = 1
+    # Opt-in throughput mode. Accumulation then counts full waves per GPU;
+    # None preserves the global-batch semantics in existing checkpoints.
+    stage1_per_device_batch_size: int | None = None
     stage1_accumulation_steps: int = 64
     stage2_accumulation_steps: int = 32
     stage1_updates: int = 20_000
@@ -75,6 +80,20 @@ class RunConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def per_device_batch(self, stage: str) -> int:
+        if stage not in ("stage1", "stage2a", "stage2b"):
+            raise ValueError(f"Unknown training stage: {stage}")
+        if stage == "stage1" and self.training.stage1_per_device_batch_size is not None:
+            return self.training.stage1_per_device_batch_size
+        return self.training.micro_batch_size
+
+    def effective_batch(self, stage: str) -> int:
+        micro = self.per_device_batch(stage)
+        accumulation = (self.training.stage1_accumulation_steps if stage == "stage1"
+                        else self.training.stage2_accumulation_steps)
+        devices = self.num_devices if stage == "stage1" and self.training.stage1_per_device_batch_size is not None else 1
+        return devices * micro * accumulation
+
     def approximation_labels(self) -> list[str]:
         labels = []
         if self.data.max_sequence_length is not None:
@@ -91,18 +110,23 @@ class RunConfig:
         return labels
 
     def validate(self) -> None:
+        if type(self.data.cache_actions) is not bool:
+            raise ValueError("data.cache_actions must be a boolean")
         if type(self.num_devices) is not int or self.num_devices <= 0:
             raise ValueError("num_devices must be a positive integer")
         if type(self.gpu_id) is not int or self.gpu_id < 0:
             raise ValueError("gpu_id must be a nonnegative physical GPU index")
         values = self.training
+        stage1_micro = values.stage1_per_device_batch_size
+        if stage1_micro is not None and (type(stage1_micro) is not int or stage1_micro <= 0):
+            raise ValueError("training.stage1_per_device_batch_size must be None or a positive integer")
         if self.num_devices > 1 and (type(values.micro_batch_size) is not int or values.micro_batch_size != 1):
             raise ValueError("Multi-device T²Mem training requires training.micro_batch_size=1 per episode")
         for name in ("micro_batch_size", "stage1_accumulation_steps", "stage2_accumulation_steps",
                      "stage1_updates", "memory_updates_per_cycle", "policy_updates_per_cycle",
                      "save_interval", "log_interval"):
-            if getattr(values, name) <= 0:
-                raise ValueError(f"training.{name} must be positive")
+            if type(getattr(values, name)) is not int or getattr(values, name) <= 0:
+                raise ValueError(f"training.{name} must be a positive integer")
         if values.alternating_cycles is not None and values.alternating_cycles <= 0:
             raise ValueError("alternating_cycles must be positive")
         keep = values.keep_last_checkpoints

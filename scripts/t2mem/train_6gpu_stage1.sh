@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Defaults to a new run on GPUs 1–6 after the earlier GPU 6 process is stopped.
+# Pass --config runs/environment/t2mem_6gpu_tuned.yaml after server-side tuning.
 # Explicit --stage resume --resume PATH preserves an existing checkpoint's
 # progress and optimizer state; choose a separate --checkpoint-dir to migrate.
 # Override this wrapper explicitly with T2MEM_DP_DEVICES; an inherited single-

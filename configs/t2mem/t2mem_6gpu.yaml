@@ -1,15 +1,20 @@
 # Six GPUs (physical 1–6), one process, synchronous data parallelism.
 # Start after the user has stopped the earlier single-device process on GPU 6.
-# Global batch remains A64 frames / B32 sequences, including masked DP tails.
+# Throughput mode: true Stage1 per-GPU batching, without gradient accumulation.
+# Tune the per-device batch on the server; 2 is only an initial candidate.
 extends: t2mem_a100_80gb.yaml
-name: pickxtimes_stage1_6gpu
+name: pickxtimes_stage1_6gpu_throughput
 gpu_id: 1
 num_devices: 6
 seed: 7
-checkpoint_dir: runs/ckpts/pickxtimes_stage1_6gpu
+checkpoint_dir: runs/ckpts/pickxtimes_stage1_6gpu_throughput
+experiment_label: "single-task throughput experiment: PickXtimes"
+data:
+  cache_actions: true
 training:
   micro_batch_size: 1
-  stage1_accumulation_steps: 64
-  stage2_accumulation_steps: 32
+  stage1_per_device_batch_size: 2
+  stage1_accumulation_steps: 1
+  stage2_accumulation_steps: 36
   save_interval: 5000
   keep_last_checkpoints: 2

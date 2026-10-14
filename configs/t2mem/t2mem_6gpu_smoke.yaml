@@ -8,6 +8,7 @@ data:
   max_sequence_length: 32
   truncate_prefix: true
 training:
+  stage1_per_device_batch_size: null
   micro_batch_size: 1
   stage1_accumulation_steps: 8
   stage2_accumulation_steps: 8

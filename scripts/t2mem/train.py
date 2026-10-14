@@ -59,6 +59,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--updates", type=int, help="Override budget for a standalone stage")
     parser.add_argument("--save-interval", type=_positive_int,
                         help="Checkpoint interval in optimizer updates; also applies when resuming")
+    parser.add_argument("--stage1-per-device-batch", type=_positive_int,
+                        help="Enable batched Stage1: global batch = devices * this value * accumulation waves")
+    parser.add_argument("--stage1-accumulation-steps", type=_positive_int,
+                        help="Override Stage1 accumulation; throughput mode counts waves per GPU")
+    parser.add_argument("--benchmark-steps", type=_positive_int,
+                        help="Fresh Stage1 only: measure this many updates after warmup, without saving weights")
+    parser.add_argument("--benchmark-warmup-steps", type=_positive_int, default=2,
+                        help="Discard these initial benchmark updates, including compilation (default: 2)")
     return parser.parse_args(argv)
 
 
@@ -105,6 +113,14 @@ def main() -> None:
         setattr(config.training, name, args.updates)
     if args.save_interval is not None:
         config.training.save_interval = args.save_interval
+    if args.stage1_per_device_batch is not None:
+        config.training.stage1_per_device_batch_size = args.stage1_per_device_batch
+    if args.stage1_accumulation_steps is not None:
+        config.training.stage1_accumulation_steps = args.stage1_accumulation_steps
+    if args.benchmark_steps is not None:
+        if args.stage != "stage1" or args.resume or args.init_checkpoint or args.updates is not None:
+            raise ValueError("Benchmark requires fresh Stage1 from official base, without resume/init/updates")
+        config.training.stage1_updates = args.benchmark_warmup_steps + args.benchmark_steps
     config.validate()
     # Environment is set before importing any JAX/Flax modules. A single GPU
     # preserves the original physical index; DP defaults to a contiguous range.
@@ -140,13 +156,17 @@ def main() -> None:
     if args.cycles is not None:
         progress.set_cycle_budget(args.cycles)
     output = expand_path(config.checkpoint_dir)
-    if resume_path is None and output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"Run directory already contains files: {output}; choose another --checkpoint-dir or resume")
+    if output.exists() and any(output.iterdir()) and (resume_path is None or output != resume_path.parent):
+        raise FileExistsError(f"Run directory already contains files: {output}; use a new output directory "
+                              "or resume within the source checkpoint's own run directory")
     output.mkdir(parents=True, exist_ok=True)
     config.checkpoint_dir = str(output)
     model_config = config.create_model_config()
     logging.info("Experiment: %s; approximations: %s", config.experiment_label, config.approximation_labels())
     logging.info("Resolved config: %s", json.dumps(config.to_dict()))
+    logging.info("Batch settings: Stage1 per-device=%s, global=%s; Stage2 per-device=%s, global=%s",
+                 config.per_device_batch("stage1"), config.effective_batch("stage1"),
+                 config.per_device_batch("stage2a"), config.effective_batch("stage2a"))
     model = model_config.create(jax.random.PRNGKey(config.seed))
     if args.init_checkpoint:
         source = latest_checkpoint(args.init_checkpoint)
@@ -190,7 +210,7 @@ def main() -> None:
                              action_supervision_stride=config.data.action_supervision_stride,
                              task_sampling=config.data.task_sampling, task_weights=config.data.task_weights,
                              seed=config.seed, max_sequence_length=config.data.max_sequence_length,
-                             truncate_prefix=config.data.truncate_prefix)
+                             truncate_prefix=config.data.truncate_prefix, cache_actions=config.data.cache_actions)
     logging.info("Task sampling probabilities: %s", dict(zip(manifest["tasks"], sampler.probabilities.tolist())))
     trainer = Trainer(model, config, progress, sampler)
     # The trainer owns the canonical model state. Release the initial single-
@@ -201,9 +221,12 @@ def main() -> None:
         if args.cycles is not None:
             trainer.progress.set_cycle_budget(args.cycles)
     (output / "resolved_config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
+    benchmark_metrics = []
     with (output / "metrics.jsonl").open("a") as log:
         while not trainer.progress.complete:
             metrics = trainer.step()
+            if args.benchmark_steps is not None:
+                benchmark_metrics.append(metrics)
             log.write(json.dumps(metrics) + "\n")
             log.flush()
             if trainer.progress.global_step % config.training.log_interval == 0:
@@ -211,9 +234,29 @@ def main() -> None:
             # Phase changes preserve optimizer/progress in memory, and are
             # included in the next snapshot. Save cadence counts optimizer
             # updates, independently of memory/policy phase boundaries.
-            if should_save_checkpoint(trainer.progress.global_step, config.training.save_interval,
-                                      complete=trainer.progress.complete):
+            if args.benchmark_steps is None and should_save_checkpoint(
+                    trainer.progress.global_step, config.training.save_interval, complete=trainer.progress.complete):
                 logging.info("Saved %s", trainer.save())
+    if args.benchmark_steps is not None:
+        measured = benchmark_metrics[args.benchmark_warmup_steps:]
+        seconds = sum(item["step_seconds"] for item in measured)
+        samples = sum(item["effective_batch"] for item in measured)
+        memory = []
+        for device in devices:
+            stats = device.memory_stats() or {}
+            memory.append({"device": str(device), "peak_bytes_in_use": stats.get("peak_bytes_in_use"),
+                           "bytes_limit": stats.get("bytes_limit")})
+        report = {"per_device_batch": config.per_device_batch("stage1"),
+                  "global_batch": config.effective_batch("stage1"), "num_devices": config.num_devices,
+                  "visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+                  "warmup_steps": args.benchmark_warmup_steps, "measured_steps": len(measured),
+                  "step_seconds": [item["step_seconds"] for item in measured],
+                  "data_seconds": [item.get("data_seconds") for item in measured],
+                  "train_seconds": [item.get("train_seconds") for item in measured],
+                  "samples_per_second": samples / seconds, "memory": memory,
+                  "weights_saved": False, "initialization_source": config.initialization_source}
+        (output / "benchmark.json").write_text(json.dumps(report, indent=2) + "\n")
+        logging.info("Benchmark (weights discarded): %s", json.dumps(report))
     logging.info("Training budget completed: %s", trainer.progress)
 
 

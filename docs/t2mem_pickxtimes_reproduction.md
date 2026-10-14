@@ -2,7 +2,11 @@
 
 本实现比较 A（自己训练的 π0.5 Stage 1）、B（从 A 的同一个 checkpoint 初始化的 Full T²Mem）、C（加载 B 的同一个 checkpoint，推理时关闭所有 writes）。训练和评估只允许 `PickXtimes`。实验标记为 **single-task reproduction: PickXtimes**，不能将论文 16-task 结果作为本实验保证；论文 Table 1 的 π0.5 / Stage 1 / T²Mem 参考值分别为 42.89% / 34.00% / 91.33%。
 
-**运行状态：用户 A100 已完成数据准备、Stage 1/2训练smoke、完整前缀交替训练和真实恢复续训，以及推理/仿真smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base 完成恢复，Stage 1 的一次优化更新及checkpoint保存成功。Stage 2从该checkpoint初始化，2A/2B各完成一次更新，每次32个observations、2次memory writes，最终checkpoint `runs/ckpts/t2mem_smoke_stage2/2`保存完成。该checkpoint的seed7、两个easy test episodes均完成rollout，状态为timeout：`valid_rollouts=2`、`infrastructure_errors=0`、`complete=true`；短训练的0/2不是正式性能结果。四种Gemma等价性用例均已通过（4 passed，58.86s），其余80项此前已通过；这些结果来自分次运行，尚无新版全套一次运行的记录。正式训练预算及150-rollout A/B/C评估仍为 **NOT RUN — requires Linux A100**。Mac 上只编辑和进行静态检查，没有安装 ML 依赖、下载数据或 checkpoint、执行前向/反向/训练/仿真，也没有 commit/push。以下安装、下载和 GPU 命令均供用户在 Linux 服务器手动执行。
+**运行状态：用户 A100 已完成数据准备、Stage 1/2训练smoke、完整前缀交替训练和真实恢复续训，以及推理/仿真smoke。** 官方 PickXtimes 100 个 training episodes 已建立索引并计算 normalization；π0.5-base恢复、单步A、32帧B、最长1025帧B及真实resume均已成功。短训练checkpoint的seed7两个easy rollouts为timeout，基础设施错误为0；0/2不是正式性能结果。四种Gemma等价性用例已通过，其余80项此前通过，尚无新版全套一次运行的记录。
+
+2026-10-13收到旧六卡正式A的step29–31日志：GPU1–6、全局batch64，约12.5frames/s。完整20,000步预算和150-rollout A/B/C评估尚未完成。用户随后选择吞吐优先，新版支持Stage1每卡batch实测选择及CPU动作缓存；新版回归、调参和重启仍待服务器执行。
+
+Mac上只编辑和进行静态检查，没有安装ML依赖、下载数据或checkpoint、执行前向/反向/训练/仿真，也没有commit/push。以下安装、下载和GPU命令均供用户在Linux服务器手动执行。
 
 当前工作账号为`gaoyuxuan2`，仓库和缓存位于`/data0/workspace/gaoyuxuan2`。2026-10-13重新下载官方权重后，Stage1 smoke已完成并保存`runs/ckpts/t2mem_smoke_stage1/1`。从这个新checkpoint初始化的完整前缀诊断也已通过：1025个observations、2048 padding bucket，Stage2A/2B各一次更新、各65次scheduled writes，loss/gradient有限、`approximations=[]`；`runs/ckpts/t2mem_fullprefix_probe/2`完成保存，最终`complete=True`。随后从`/2`实际恢复params和train_state，将总预算扩至2cycles，step3/4继续完成2A/2B，最终`runs/ckpts/t2mem_fullprefix_resume/4`保存成功、`complete=True`。旧账号`/data1`的首次完整前缀保存曾因ENOSPC退出；本次`/data0`运行及续训均完成两个阶段。完整前缀诊断仍为effective batch1，正式batch32及多长度长期训练尚待验证；上述32帧Stage2和两个rollout结果来自旧账号。
 
@@ -106,7 +110,7 @@ normalization 仅由该任务 training execution frames 计算：前 7 维关节
 |---|---|
 | `configs/t2mem/t2mem_paper.yaml` | 论文 Table 2/3 的 memory 参数、H64、stride16、完整梯度路径；缩减为 PickXtimes |
 | `configs/t2mem/t2mem_a100_80gb.yaml` | 单卡、BF16 backbone、FP32 slow master/fast weights、rematerialization、gradient accumulation |
-| `configs/t2mem/t2mem_6gpu.yaml` | GPU1–6同步数据并行；全局batch A64/B32，20,000步A；每5,000步及结束保存 |
+| `configs/t2mem/t2mem_6gpu.yaml` | GPU1–6吞吐模式；A初始每卡batch2/全局12，可实测选择；B全局36，每5,000步及结束保存 |
 | `configs/t2mem/t2mem_6gpu_smoke.yaml` | 六卡batch8，覆盖6个有效槽加2个有效尾槽；Stage2显式32帧截断诊断 |
 | `configs/t2mem/t2mem_smoke.yaml` | 一次 Stage 1 更新和一个 A/B cycle；**显式 approximation：保留序列末 32 个 observations，丢弃更早 history** |
 | `configs/t2mem/t2mem_ablation.yaml` | no-write 的配置示意；C 不使用它重新训练，而使用 B checkpoint + `--ablation no-online-write` |
@@ -187,13 +191,21 @@ bash scripts/t2mem/train_stage1.sh --checkpoint-dir runs/ckpts/pickxtimes_stage1
 
 ### 六卡数据并行：GPU1–6
 
-用户随后授权使用六卡共同加速一个模型，并将设备选择从GPU0–5改为GPU1–6，计划自行停止原GPU6上的进程。用户最终明确选择从官方π0.5-base重新训练，不从旧单卡快照续训。六卡运行使用独立`runs/ckpts/pickxtimes_stage1_6gpu`；原单卡checkpoint目录保留。模型架构、训练数据、learning rates及全局batch均沿用正式配置。这里是数据并行，每张卡保存完整模型副本，不合并显存，也不采用FSDP。
+2026-10-13更新：旧六卡正式A已经开始训练，收到step31；尚未完成20,000步预算。下面新版吞吐配置将重新从官方base开始，GPU验证状态单独记录。
 
-实现使用锁定[JAX0.5.3的shard_map](https://raw.githubusercontent.com/jax-ml/jax/jax-v0.5.3/jax/experimental/shard_map.py)和NamedSharding。每卡每波一个独立sample、独立W0，host sampler唯一。A64分成10波×6加尾波4，B32分成5波×6加尾波2；尾波空槽的action/write/observation masks全False，不消费sampler或canonical RNG。局部梯度跨波累积后，仅在优化更新末尾归约一次，除以真实64/32，随后统一clip及一次AdamW更新；Stage2保持每episode先平均、episode之间等权。波内按最长sequence共同补齐到下一2的幂，完整历史和二阶梯度保留；每波完成后再载入下一波，避免异步队列积压长序列。普通逻辑形状的slow参数、optimizer states和RNG复制到各卡，保存仍是一份原shape的checkpoint，单卡推理可加载；浮点归约顺序变化，不声称与串行训练逐位相同。
+用户授权GPU1–6同步数据并行，从官方π0.5-base重新训练，并随后明确以A100利用率和吞吐为优先，允许改变全局batch。旧六卡A已经运行：2026-10-13的step29–31均为`num_devices=6`、`effective_batch=64`、`parallel_waves=11`、`approximations=[]`；相邻更新5.096s与5.139s，约12.5frames/s。用户同时观察到Stage1各卡显存约34–38GiB、瞬时GPU利用率0–35%。这证明旧micro1六卡路径可执行；新版每卡多样本路径仍待服务器验证。checkpoint保存时的0%利用率不代表稳定训练吞吐。
+
+新版使用独立`runs/ckpts/pickxtimes_stage1_6gpu_throughput`。模型、数据和learning rates保持当前配置，A每卡一次处理多个execution frames，实际批量矩阵计算；默认每卡2、无额外累积，即全局12，这只是调参起点。新增`training.stage1_per_device_batch_size=M`时，A全局batch为`num_devices × M × stage1_accumulation_steps`，accumulation表示每卡累积波数。设为`null`或旧metadata缺少此字段时保留旧语义：全局batch仍为`micro_batch_size × accumulation_steps`，GPU数不隐式乘入。B完整历史及高阶梯度仍为每卡一个episode，全局batch改为36（六个满波），避免直接把不等长episode变成按frame数加权的目标。这里是数据并行，每卡保存完整模型副本。
+
+实现使用锁定[JAX0.5.3的shard_map](https://raw.githubusercontent.com/jax-ml/jax/jax-v0.5.3/jax/experimental/shard_map.py)和NamedSharding，输入为`[devices,time,per_device_batch,...]`。host sampler唯一，dummy的action/write/observation masks全False；局部mean梯度乘真实样本数后归约，除以真实全局样本数，最后统一clip及一次AdamW更新，部分满卡和尾槽也保持等sample权重。Stage1每sample一个frame，不等H64尾动作mask先在sample内归一化；Stage2每episode先平均、episode之间等权。micro1保留原canonical RNG流；批量Stage1每卡batch使用独立key，随机轨迹随batch分组改变。完整历史和二阶梯度保留，每波结束后再载入下一波。slow参数和optimizer的逻辑shape不变，checkpoint仍可用于单卡推理。
+
+调参保持A20,000 optimizer updates、LR2e-5及5,000步保存间隔，不自动线性缩放LR或更改步数。因此A的frame曝光量变为`20,000 × 6 × 所选每卡batch`；这是用户选择的吞吐实验，已经不采用论文的A64/B32 batch预算。
+
+吞吐配置还启用`data.cache_actions=true`：构造sampler时预读训练manifest各episode的小型expert-action timeline到CPU，future H64目标直接切片，避免每个sample重复查询未来64帧的HDF5动作对象。图像仍按需读取；demo、缺失标签、chunk边界和8维action masks保持相同含义。缓存不进入checkpoint、不消耗采样RNG；resume时重建。预读在计时前完成，避免不同batch候选的缓存预热程度影响比较；旧metadata默认关闭。
 
 新六卡正式配置每5,000 optimizer updates保存，训练结束也保存；phase切换不额外保存。A最终保存`/20000`，保留最近两份，因此完成时通常为`/15000`与`/20000`。B若总预算为4cycles、4000updates，将在结束时保存`/4000`。`--save-interval`可以对fresh或resume运行显式覆盖保存间隔。已启动的原单卡进程继续使用其启动时配置，修改仓库文件不会改变它的内存配置。
 
-六卡实现目前只完成本地静态检查，**六卡pytest、GPU smoke及速度实测均NOT RUN**。新增小模型用例检查64/32真实batch与尾槽、长短episode等权、早期write的高阶梯度、单卡/多卡更新及RNG/sampler一致性、真实恢复续训、原shape checkpoint单卡加载、正式初始化预算及5,000步保存cadence。先在服务器使用六个CPU逻辑设备运行这些回归，不加载官方模型或占用训练GPU：
+新版批量Stage1和自动调参只完成本地静态检查，**新版pytest和GPU吞吐调参NOT RUN**。小模型回归覆盖旧64/32语义、每卡多sample和不均匀尾槽、真实样本数权重、Stage2历史/二阶梯度、checkpoint恢复及5,000步保存。先在服务器使用六个CPU逻辑设备运行，不加载官方模型或占用训练GPU：
 
 ```bash
 CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu \
@@ -222,31 +234,30 @@ uv run --no-sync python scripts/t2mem/train.py \
   --checkpoint-dir runs/ckpts/pickxtimes_6gpu_smoke_stage2 --cycles 1
 ```
 
-两阶段各一次更新，只有结束时保存`/2`。六卡smoke通过后启动正式A：
+两阶段各一次更新，只有结束时保存`/2`。上述smoke保留旧global8尾槽诊断。通过回归后，先停止已有六卡训练，在独占GPU1–6的情况下测Stage1每卡batch：
 
 ```bash
-bash scripts/t2mem/train_6gpu_stage1.sh
+uv run --no-sync python scripts/t2mem/tune_stage1_batch.py
 ```
 
-该wrapper默认GPU1–6，使用独立正式root、现有环境及`--no-sync`，默认注入`--num-devices 6 --gpu-id 1 --save-interval 5000`。显式`T2MEM_DP_DEVICES`可替换设备选择，不会继承`env.sh`里旧单卡的`CUDA_VISIBLE_DEVICES=6`。正式首条更新预期`effective_batch=64`、`parallel_waves=11`、`num_devices=6`、`approximations=[]`。吞吐取决于模型计算、跨卡通信及共享CPU/磁盘读取，实际加速比须比较编译完成后的同预算稳定更新，不能宣称六倍加速。普通resume默认采用保存的设备数；新增`--num-devices`和`--gpu-id`允许在JAX初始化前显式改变设备配置，保留全局batch及已保存的训练状态。
+调参逐个测试每卡1/2/4/8/16/32/64，遇到明确显存不足即停止更大的候选；其他错误直接失败。每个候选启动独立JAX进程，退出后释放显存和首卡初始化缓存；从官方base加载，先2次warmup，再计时3次真实训练更新。计时包含sampler、CPU transforms、数据传输、计算和optimizer同步，排除首次编译和checkpoint保存；不保存调参模型。按实测samples/s选择候选，而不是只看最大batch或显存占用。所有日志和测量写入`runs/benchmarks/stage1_batch_TIMESTAMP`，输出`runs/environment/t2mem_6gpu_tuned.yaml`，不会自动开始正式训练。`--candidates`、`--steps`、`--warmup-steps`可显式覆盖；输出配置已存在时拒绝覆盖，可指定新的`--output-config`。
 
-当前正式六卡A使用上述fresh命令，从官方base训练20,000步。以下迁移入口仅是保留的可选能力，本次不使用：旧单卡正式A若已有完整快照，可从最后保存的步数迁移至六卡，保留optimizer/RNG/sampler并将后续保存间隔改为5,000；使用新root保留原快照：
+调参成功后，从官方base新启动A：
 
 ```bash
 bash scripts/t2mem/train_6gpu_stage1.sh \
-  --stage resume --resume runs/ckpts/pickxtimes_stage1 \
-  --checkpoint-dir runs/ckpts/pickxtimes_stage1_6gpu
+  --config runs/environment/t2mem_6gpu_tuned.yaml
 ```
 
-原单卡run没有完整`metadata.json`时，从官方base新启动上述六卡A。未保存的microbatch或更新不会恢复；smoke `/1`不替代正式A的续训来源。新六卡root必须为空，不能同时启动多份任务写入同一目录。六卡B沿用同一正式配置及已完成的A：
+wrapper默认GPU1–6及5,000步保存，不会继承`env.sh`中的旧`CUDA_VISIBLE_DEVICES=6`。正式日志预期`per_device_batch_size=所选M`、`effective_batch=6M`、`parallel_waves=1`、`num_devices=6`、`approximations=[]`，并记录`step_seconds`、`samples_per_second`。新的checkpoint root必须为空；修改文件不会改变正在运行的旧进程配置。checkpoint提交及单卡推理格式保留。六卡B使用完成的新A：
 
 ```bash
 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
 uv run --no-sync python scripts/t2mem/train.py \
-  --config configs/t2mem/t2mem_6gpu.yaml --stage alternating \
-  --init-checkpoint runs/ckpts/pickxtimes_stage1_6gpu/20000 \
-  --checkpoint-dir runs/ckpts/pickxtimes_t2mem_6gpu --cycles 4
+  --config runs/environment/t2mem_6gpu_tuned.yaml --stage alternating \
+  --init-checkpoint runs/ckpts/pickxtimes_stage1_6gpu_throughput/20000 \
+  --checkpoint-dir runs/ckpts/pickxtimes_t2mem_6gpu_throughput --cycles 4
 ```
 
 此处4cycles仍为操作者选择的示例预算；评估A/B/C时分别使用对应六卡A和B的路径，C加载B同一checkpoint关闭writes，不重新训练。

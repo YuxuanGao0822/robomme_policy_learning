@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any
 
 from flax import nnx, traverse_util
@@ -249,8 +250,8 @@ class Trainer:
         self.replica_sharding = None
         self.slot_sharding = None
         if self.mesh is not None:
-            if config.training.micro_batch_size != 1:
-                raise ValueError("Data-parallel training requires micro_batch_size=1 per device")
+            if config.per_device_batch("stage2a") != 1:
+                raise ValueError("Data-parallel Stage 2 requires micro_batch_size=1 per device")
             self.replica_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
             self.slot_sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(DATA_AXIS))
             self.state = self._put_replicated(self.state)
@@ -298,11 +299,26 @@ class Trainer:
             nnx.update(model, train_state)
             model.train()
             observation = T2Observation.from_dict(batch["observation"])
-            return model.compute_sequence_loss(rng, observation, batch["actions"], batch["action_mask"],
-                                               batch["write_mask"], batch["observation_mask"],
-                                               train=True, memory_enabled=stage != "stage1")
+            loss, stats = model.compute_sequence_loss(
+                rng, observation, batch["actions"], batch["action_mask"],
+                batch["write_mask"], batch["observation_mask"],
+                train=True, memory_enabled=stage != "stage1",
+            )
+            if stage == "stage1" and self.config.per_device_batch(stage) > 1:
+                # Stage 1 samples exactly one frame per example. The objective
+                # is already a mean of normalized chunk losses, but these two
+                # auxiliary fields are sums. Convert them to per-real-frame
+                # means before the parallel wrapper weights every local mean.
+                if batch["actions"].shape[0] != 1:
+                    raise ValueError("Batched Stage 1 requires one-frame samples")
+                real_frames = jnp.sum(batch["observation_mask"] & batch["action_mask"].any(axis=(-2, -1)))
+                stats = {name: value / jnp.maximum(real_frames, 1)
+                         if name in ("supervised_chunks", "scheduled_writes") else value
+                         for name, value in stats.items()}
+            return loss, stats
 
-        self.grad_fns[stage] = (make_parallel_grad(loss_fn, self.mesh) if self.mesh is not None
+        self.grad_fns[stage] = (make_parallel_grad(loss_fn, self.mesh, self.config.per_device_batch(stage))
+                               if self.mesh is not None
                                else jax.jit(jax.value_and_grad(loss_fn, has_aux=True)))
 
         def apply(params: Any, gradients: Any, opt_state: Any) -> Any:
@@ -322,14 +338,19 @@ class Trainer:
         loss_sum = 0.0
         stats_sums: dict[str, float] = {}
         sequence_lengths, supervised_frames, memory_writes = [], [], []
+        data_seconds = 0.0
+        micro_batch_size = self.config.per_device_batch(stage)
         for _ in range(accumulation):
+            data_started = time.perf_counter()
             samples = [self.sampler.sample(task, stage1=stage == "stage1")
-                       for _ in range(self.config.training.micro_batch_size)]
+                       for _ in range(micro_batch_size)]
             for sample in samples:
                 sequence_lengths.append(int(sample.observation_mask.sum()))
                 supervised_frames.append(int(sample.action_mask.any(axis=(-2, -1)).sum()))
                 memory_writes.append(int(sample.write_mask.sum()))
-            batch = jax.device_put(collate_sequences(samples))
+            batch = collate_sequences(samples)
+            data_seconds += time.perf_counter() - data_started
+            batch = jax.device_put(batch)
             self.rng, loss_rng = jax.random.split(self.rng)
             (loss, stats), grads = self.grad_fns[stage](active, self.state, loss_rng, batch)
             gradients = grads if gradients is None else self.accumulate(gradients, grads)
@@ -342,29 +363,37 @@ class Trainer:
         gradients = jax.tree.map(lambda value: value / accumulation, gradients)
         return (gradients, loss_sum / accumulation,
                 {name: value / accumulation for name, value in stats_sums.items()},
-                sequence_lengths, supervised_frames, memory_writes, accumulation)
+                sequence_lengths, supervised_frames, memory_writes, accumulation, data_seconds)
 
     def _parallel_gradients(self, stage: str, active: dict, task: str, global_batch: int) -> tuple:
         local_sums = None
         sequence_lengths, supervised_frames, memory_writes = [], [], []
-        sizes = wave_sizes(global_batch, self.config.num_devices)
+        data_seconds = 0.0
+        micro_batch_size = self.config.per_device_batch(stage)
+        sizes = wave_sizes(global_batch, self.config.num_devices, micro_batch_size)
         for size in sizes:
-            samples, keys = [], []
+            data_started = time.perf_counter()
+            samples = []
             for _ in range(size):
                 sample = self.sampler.sample(task, stage1=stage == "stage1")
                 samples.append(sample)
-                # Consume exactly the original micro1 stream: one split per
-                # real episode, none for empty slots in the final wave.
-                self.rng, loss_rng = self.split_rng(self.rng)
-                keys.append(loss_rng)
                 sequence_lengths.append(int(sample.observation_mask.sum()))
                 supervised_frames.append(int(sample.action_mask.any(axis=(-2, -1)).sum()))
                 memory_writes.append(int(sample.write_mask.sum()))
-            batch, valid = collate_parallel_wave(samples, self.config.num_devices)
+            batch, valid = collate_parallel_wave(samples, self.config.num_devices, micro_batch_size)
+            data_seconds += time.perf_counter() - data_started
+            keys = []
+            for real_count in valid:
+                # One independent key per real device microbatch. With M=1 this
+                # is the original per-episode stream; empty devices consume none.
+                if real_count > 0:
+                    self.rng, loss_rng = self.split_rng(self.rng)
+                    keys.append(loss_rng)
+                else:
+                    keys.append(keys[0])
             batch = jax.device_put(batch, self.slot_sharding)
             valid = jax.device_put(valid, self.slot_sharding)
-            keys = jax.device_put(jnp.stack(keys + [keys[0]] * (self.config.num_devices - size)),
-                                  self.slot_sharding)
+            keys = jax.device_put(jnp.stack(keys), self.slot_sharding)
             (loss, stats), grads = self.grad_fns[stage](active, self.state, keys, batch, valid)
             wave = {"gradients": grads, "loss": loss, "stats": stats}
             local_sums = wave if local_sums is None else self.parallel_accumulate(local_sums, wave)
@@ -376,14 +405,15 @@ class Trainer:
             # graph or fast-state carry between independently sampled episodes.
             del sample, samples, batch, valid, keys, grads, loss, stats, wave
         # One collective over all waves, before clipping and a single AdamW
-        # update. Every real episode gets weight 1/global_batch, including tails.
+        # update. Every real example gets weight 1/global_batch, including tails.
         reduced = self.reduce_gradients(local_sums, self._put_replicated(jnp.asarray(global_batch, jnp.float32)))
         loss, stats = jax.device_get((reduced["loss"], reduced["stats"]))
         return (reduced["gradients"], float(loss),
                 {name: float(np.asarray(value).mean()) for name, value in stats.items()},
-                sequence_lengths, supervised_frames, memory_writes, len(sizes))
+                sequence_lengths, supervised_frames, memory_writes, len(sizes), data_seconds)
 
     def step(self) -> dict:
+        started = time.perf_counter()
         stage = self.progress.phase
         cycle, phase_step = self.progress.cycle, self.progress.phase_step
         self.ensure_optimizer(stage)
@@ -391,16 +421,18 @@ class Trainer:
         accumulation = (self.config.training.stage1_accumulation_steps if stage == "stage1"
                         else self.config.training.stage2_accumulation_steps)
         task = self.sampler.next_task()
-        effective_batch = accumulation * self.config.training.micro_batch_size
+        effective_batch = self.config.effective_batch(stage)
         if self.mesh is None:
             result = self._single_gradients(stage, active, task, accumulation)
         else:
             result = self._parallel_gradients(stage, active, task, effective_batch)
-        gradients, loss, stats, sequence_lengths, supervised_frames, memory_writes, waves = result
+        gradients, loss, stats, sequence_lengths, supervised_frames, memory_writes, waves, data_seconds = result
         gradient_norm = float(jax.device_get(optax.global_norm(gradients)))
         if not np.isfinite(loss) or not np.isfinite(gradient_norm):
             raise FloatingPointError(f"Non-finite {stage} objective/gradient at step {self.progress.global_step}")
         new_params, new_opt_state = self.update_fns[stage](active, gradients, self.optimizer_states[stage])
+        # Include device work in timing, rather than only asynchronous dispatch.
+        jax.block_until_ready((new_params, new_opt_state))
         active_state = self.state.filter(stage_filter(stage))
         active_state.replace_by_pure_dict(new_params)
         model = nnx.merge(self.graphdef, self.state)
@@ -408,10 +440,15 @@ class Trainer:
         self.state = nnx.state(model)
         self.optimizer_states[stage] = new_opt_state
         self.progress.advance(self.config)
+        elapsed = time.perf_counter() - started
         return {"step": self.progress.global_step, "stage": stage, "cycle": cycle, "phase_step": phase_step + 1,
                 "loss": loss, "gradient_norm": gradient_norm, "task": task,
                 "effective_batch": effective_batch, "num_devices": self.config.num_devices,
-                "parallel_waves": waves,
+                "parallel_waves": waves, "per_device_batch_size": self.config.per_device_batch(stage),
+                "step_seconds": elapsed, "samples_per_second": effective_batch / elapsed,
+                # Remaining time includes transfer, dispatch, compilation,
+                # collectives, optimization and host control, not pure GPU time.
+                "data_seconds": data_seconds, "train_seconds": elapsed - data_seconds,
                 "sequence_length_mean": float(np.mean(sequence_lengths)), "sequence_length_max": max(sequence_lengths),
                 "supervised_frames": sum(supervised_frames), "scheduled_memory_writes": sum(memory_writes),
                 "task_updates": dict(self.sampler.task_updates), "task_samples": dict(self.sampler.task_samples),

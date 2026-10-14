@@ -141,7 +141,54 @@ def make_transforms(model_config: Any, norm_stats: dict) -> Any:
     ])
 
 
-def read_frame(episode: h5py.Group, step: int, prompt: str, horizon: int, action_dim: int) -> tuple[dict, np.ndarray]:
+@dataclass(frozen=True)
+class ActionTimeline:
+    """Small CPU-only label timeline; images and robot observations stay lazy."""
+
+    present: np.ndarray
+    is_demo: np.ndarray
+    has_action: np.ndarray
+    valid_action: np.ndarray
+    actions: np.ndarray
+
+
+def cache_episode_actions(episode: h5py.Group) -> ActionTimeline:
+    """Read action metadata once, preserving holes and ignored demo labels.
+
+    Invalid numeric labels are marked, so a later query raises at the same
+    physical action as the uncached loader. An invalid action after a hole or
+    on a demonstration frame is never made into a supervised target.
+    """
+    steps = [int(key[9:]) for key in episode if re.fullmatch(r"timestep_\d+", key)]
+    length = max(steps, default=-1) + 1
+    present = np.zeros(length, bool)
+    is_demo = np.zeros(length, bool)
+    has_action = np.zeros(length, bool)
+    valid_action = np.zeros(length, bool)
+    actions = np.zeros((length, 8), np.float32)
+    for step in steps:
+        source = episode[f"timestep_{step}"]
+        present[step] = True
+        is_demo[step] = bool(_scalar(source["info/is_video_demo"][()]))
+        has_action[step] = "action/joint_action" in source
+        if has_action[step] and not is_demo[step]:
+            try:
+                action = np.asarray(source["action/joint_action"][()], dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError):
+                # Defer malformed numeric labels just like wrong-width/NaN
+                # labels, including those outside the queried horizon or after
+                # the first hole in physical time.
+                continue
+            valid_action[step] = action.size == 8 and np.all(np.isfinite(action))
+            if valid_action[step]:
+                actions[step] = action
+    for value in (present, is_demo, has_action, valid_action, actions):
+        value.setflags(write=False)
+    return ActionTimeline(present, is_demo, has_action, valid_action, actions)
+
+
+def read_frame(episode: h5py.Group, step: int, prompt: str, horizon: int, action_dim: int,
+               action_cache: ActionTimeline | None = None) -> tuple[dict, np.ndarray]:
     """Read one image pair and future chunk; padded elements get no supervision."""
     frame = episode[f"timestep_{step}"]
     obs = frame["obs"]
@@ -150,7 +197,19 @@ def read_frame(episode: h5py.Group, step: int, prompt: str, horizon: int, action
     actions = np.zeros((horizon, 8), np.float32)
     mask = np.zeros((horizon, action_dim), bool)
     is_demo = bool(_scalar(frame["info/is_video_demo"][()]))
-    if not is_demo:
+    if not is_demo and action_cache is not None:
+        end = min(step + horizon, len(action_cache.present))
+        holes = np.flatnonzero(~action_cache.present[step:end])
+        if holes.size:
+            end = step + int(holes[0])
+        labels = ~action_cache.is_demo[step:end] & action_cache.has_action[step:end]
+        invalid = np.flatnonzero(labels & ~action_cache.valid_action[step:end])
+        if invalid.size:
+            raise ValueError(f"Invalid expert action at {episode.name}/timestep_{step + int(invalid[0])}")
+        length = end - step
+        actions[:length] = np.where(labels[:, None], action_cache.actions[step:end], 0.0)
+        mask[:length, :8] = labels[:, None]
+    elif not is_demo:
         for future in range(horizon):
             key = f"timestep_{step + future}"
             if key not in episode:
@@ -199,7 +258,8 @@ class EpisodeSampler:
                  write_stride: int = 16, demonstration_write_offset: int = 0,
                  action_supervision_stride: int = 1, task_sampling: str = "uniform",
                  task_weights: dict[str, float] | None = None, seed: int = 0,
-                 max_sequence_length: int | None = None, truncate_prefix: bool = False):
+                 max_sequence_length: int | None = None, truncate_prefix: bool = False,
+                 cache_actions: bool = False):
         self.by_task = {task: [e for e in manifest["episodes"] if e["task"] == task] for task in TASKS}
         self.transform, self.horizon, self.action_dim = transform, horizon, action_dim
         self.write_stride, self.demo_offset = write_stride, demonstration_write_offset
@@ -227,6 +287,33 @@ class EpisodeSampler:
         self.rng = np.random.default_rng(seed)
         self.task_updates = Counter()
         self.task_samples = Counter()
+        if type(cache_actions) is not bool:
+            raise ValueError("cache_actions must be a boolean")
+        self.action_timelines: dict[tuple[str, str], ActionTimeline] = {}
+        if cache_actions:
+            if manifest.get("split") != "train":
+                raise ValueError("Action caching requires an official training manifest")
+            sources: dict[str, list[dict]] = {}
+            for entries in self.by_task.values():
+                for entry in entries:
+                    path = Path(entry["path"])
+                    validate_train_source(path)
+                    if path.name not in training_filenames(entry["task"]):
+                        raise ValueError("Episode task identity must match the official HDF5 filename")
+                    sources.setdefault(entry["path"], []).append(entry)
+            # Complete construction before timed updates; each candidate gets
+            # the same label cache, independently of its warmup sample draws.
+            for path, entries in sources.items():
+                with h5py.File(path, "r") as source:
+                    if "split" in source.attrs and str(_scalar(source.attrs["split"])).lower() not in ("train", "training"):
+                        raise ValueError(f"Non-training split in {path}")
+                    for entry in entries:
+                        key = (path, entry["episode"])
+                        if key not in self.action_timelines:
+                            episode = source[entry["episode"]]
+                            if "split" in episode.attrs and str(_scalar(episode.attrs["split"])).lower() not in ("train", "training"):
+                                raise ValueError(f"Non-training episode: {path}:{entry['episode']}")
+                            self.action_timelines[key] = cache_episode_actions(episode)
 
     def next_task(self) -> str:
         task = str(self.rng.choice(TASKS, p=self.probabilities))
@@ -269,7 +356,8 @@ class EpisodeSampler:
         with h5py.File(entry["path"], "r") as source:
             episode = source[entry["episode"]]
             for t in steps:
-                raw, mask = read_frame(episode, t, entry["prompt"], self.horizon, self.action_dim)
+                raw, mask = read_frame(episode, t, entry["prompt"], self.horizon, self.action_dim,
+                                       self.action_timelines.get((entry["path"], entry["episode"])))
                 if t < start or (not stage1 and (t - start) % self.supervision_stride != 0):
                     mask[:] = False
                 frames.append(self.transform(raw))

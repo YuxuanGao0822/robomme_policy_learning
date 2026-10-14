@@ -17,7 +17,7 @@ import pytest
 
 from mme_vla_suite.models.t2mem.configuration import RunConfig, load_run_config
 from mme_vla_suite.models.t2mem.dataset import (
-    EpisodeSampler, TASKS, build_manifest, collate_sequences, load_manifest, read_frame,
+    EpisodeSampler, TASKS, build_manifest, cache_episode_actions, collate_sequences, load_manifest, read_frame,
 )
 from mme_vla_suite.models.t2mem.training import (
     PhaseProgress, Trainer, _prune_checkpoints, latest_checkpoint, load_initial_parameters, parameter_group, stage_filter,
@@ -158,6 +158,124 @@ def test_demo_actions_are_never_supervised(training_data):
     with h5py.File(root / "data_PickXtimes.h5", "r") as source:
         _, mask = read_frame(source["episode_4"], 0, "instruction", 64, 32)
         assert not mask.any()
+
+
+def _assert_same_sample(expected, actual):
+    assert expected.task == actual.task and expected.episode == actual.episode
+    assert expected.approximations == actual.approximations
+    for left, right in zip(jax.tree.leaves(expected.observation), jax.tree.leaves(actual.observation), strict=True):
+        np.testing.assert_array_equal(left, right)
+    for name in ("actions", "action_mask", "write_mask", "observation_mask", "physical_steps"):
+        np.testing.assert_array_equal(getattr(expected, name), getattr(actual, name))
+
+
+def test_cached_action_targets_preserve_demo_missing_labels_and_horizon_bounds(training_data):
+    root, _ = training_data
+    with h5py.File(root / "data_PickXtimes.h5", "r+") as source:
+        episode = source["episode_4"]
+        episode.copy("timestep_2", "timestep_3")
+        episode["timestep_3/action/joint_action"][()] = np.full(8, 3, np.float32)
+        episode["timestep_1/info/is_video_demo"][()] = True
+        # Demo labels are ignored, even if they contain invalid values.
+        episode["timestep_1/action/joint_action"][()] = np.full(8, np.nan, np.float32)
+        del episode["timestep_2/action/joint_action"]
+        cached = cache_episode_actions(episode)
+        for step in range(4):
+            for horizon in (1, 2, 64):
+                expected, expected_mask = read_frame(episode, step, "Pick three times", horizon, 32)
+                actual, actual_mask = read_frame(episode, step, "Pick three times", horizon, 32, cached)
+                assert expected["prompt"] == actual["prompt"]
+                for name in ("observation/image", "observation/wrist_image", "observation/state", "actions"):
+                    np.testing.assert_array_equal(expected[name], actual[name])
+                np.testing.assert_array_equal(expected_mask, actual_mask)
+                assert not actual_mask[:, 8:].any()
+        _, mask = read_frame(episode, 0, "Pick three times", 64, 32, cached)
+        np.testing.assert_array_equal(mask[:4, 0], [True, False, False, True])
+        assert not mask[4:].any()
+
+
+@pytest.mark.parametrize("invalid", [np.full(8, np.nan), np.full(8, np.inf), np.ones(7), np.full(8, b"bad_float")])
+def test_action_cache_keeps_hole_break_and_numeric_action_validation(training_data, invalid):
+    root, _ = training_data
+    with h5py.File(root / "data_PickXtimes.h5", "r+") as source:
+        episode = source["episode_4"]
+        del episode["timestep_1"]
+        del episode["timestep_2/action/joint_action"]
+        episode.create_dataset("timestep_2/action/joint_action", data=invalid)
+        cache = cache_episode_actions(episode)
+        # An invalid action beyond the first physical hole cannot enter H64.
+        expected, expected_mask = read_frame(episode, 0, "Pick", 64, 32)
+        actual, actual_mask = read_frame(episode, 0, "Pick", 64, 32, cache)
+        np.testing.assert_array_equal(expected["actions"], actual["actions"])
+        np.testing.assert_array_equal(expected_mask, actual_mask)
+        assert actual_mask[0, :8].all() and not actual_mask[1:].any()
+        for action_cache in (None, cache):
+            # The raw path reports NumPy's conversion error for byte strings;
+            # cached numeric-invalid flags identify the queried physical frame.
+            match = None if action_cache is None and invalid.dtype.kind == "S" else "Invalid expert action at /episode_4/timestep_2"
+            with pytest.raises(ValueError, match=match):
+                read_frame(episode, 2, "Pick", 64, 32, action_cache)
+
+
+def test_eager_action_cache_keeps_sampling_rng_targets_and_checkpoint_state_unchanged(training_data):
+    _, manifest = training_data
+    uncached = EpisodeSampler(manifest, transform, seed=17)
+    cached = EpisodeSampler(manifest, transform, seed=17, cache_actions=True)
+    assert uncached.state_dict() == cached.state_dict()
+    # An unrelated task file in the fixture is not HDF5; eager construction must
+    # still succeed and cache exactly the official training episode.
+    assert set(cached.action_timelines) == {(entry["path"], entry["episode"]) for entry in manifest["episodes"]}
+    for stage1 in (True, False, True, False):
+        task = uncached.next_task()
+        assert cached.next_task() == task
+        _assert_same_sample(uncached.sample(task, stage1=stage1), cached.sample(task, stage1=stage1))
+        assert uncached.state_dict() == cached.state_dict()
+    # Only RNG/counters are serialized; a new resumed process builds its own
+    # CPU labels before restoring the exact host-sampler stream.
+    resumed = EpisodeSampler(manifest, transform, seed=999, cache_actions=True)
+    resumed.load_state_dict(cached.state_dict())
+    task = cached.next_task()
+    assert resumed.next_task() == task
+    _assert_same_sample(cached.sample(task, stage1=False), resumed.sample(task, stage1=False))
+    assert resumed.state_dict() == cached.state_dict()
+
+
+@pytest.mark.parametrize("stage1", [False, True])
+def test_eager_cached_samples_do_not_read_future_hdf5_action_fields(training_data, stage1):
+    root, manifest = training_data
+    reference = EpisodeSampler(manifest, transform, seed=23)
+    cached = EpisodeSampler(manifest, transform, seed=23, cache_actions=True)
+    task = reference.next_task()
+    assert cached.next_task() == task
+    expected = reference.sample(task, stage1=stage1)
+    # The cache has already materialized every label without drawing samples.
+    # Removing source action fields makes any future HDF5 lookup observable.
+    with h5py.File(root / "data_PickXtimes.h5", "r+") as source:
+        episode = source["episode_4"]
+        for step in range(3):
+            del episode[f"timestep_{step}/action/joint_action"]
+        _, raw_mask = read_frame(episode, 0, "Pick", 64, 32)
+        assert not raw_mask.any()
+    actual = cached.sample(task, stage1=stage1)
+    _assert_same_sample(expected, actual)
+    assert reference.state_dict() == cached.state_dict()
+
+
+def test_action_cache_rejects_heldout_sources_before_opening_them(training_data):
+    root, manifest = training_data
+    invalid = {**manifest, "split": "validation"}
+    with pytest.raises(ValueError, match="training manifest"):
+        EpisodeSampler(invalid, transform, cache_actions=True)
+    invalid = {**manifest, "episodes": [{**manifest["episodes"][0],
+                                       "path": str(root / "validation/record_dataset_PickXtimes.h5")}]}
+    with pytest.raises(ValueError, match="Held-out data"):
+        EpisodeSampler(invalid, transform, cache_actions=True)
+    # A stale manifest's train flag cannot override an explicitly held-out
+    # source split under an otherwise valid official training filename.
+    with h5py.File(root / "data_PickXtimes.h5", "r+") as source:
+        source.attrs["split"] = "validation"
+    with pytest.raises(ValueError, match="Non-training split"):
+        EpisodeSampler(manifest, transform, cache_actions=True)
 
 
 class TinyModel(nnx.Module):

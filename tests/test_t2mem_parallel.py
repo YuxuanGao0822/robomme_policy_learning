@@ -22,7 +22,7 @@ from jax.sharding import Mesh
 import numpy as np
 import pytest
 
-from mme_vla_suite.models.t2mem.configuration import RunConfig, load_run_config
+from mme_vla_suite.models.t2mem.configuration import RunConfig, config_from_dict, load_run_config
 from mme_vla_suite.models.t2mem.dataset import SequenceSample, collate_sequences
 from mme_vla_suite.models.t2mem.observation import T2Observation
 from mme_vla_suite.models.t2mem.parallel import (
@@ -53,23 +53,80 @@ def test_invalid_wave_counts_fail_before_sampling(global_batch, num_devices):
         wave_sizes(global_batch, num_devices)
 
 
-def test_formal_and_smoke_six_gpu_configurations_preserve_global_batches_and_physical_selection():
+@pytest.mark.parametrize(
+    ("global_batch", "num_devices", "micro_batch_size", "expected"),
+    [(6, 2, 2, (4, 2)), (7, 2, 2, (4, 3)), (14, 6, 2, (12, 2)), (3, 6, 2, (3,))],
+)
+def test_per_device_microbatches_bound_waves_without_rounding_up_global_batch(
+    global_batch, num_devices, micro_batch_size, expected,
+):
+    actual = wave_sizes(global_batch, num_devices, micro_batch_size=micro_batch_size)
+    assert actual == expected
+    assert sum(actual) == global_batch
+    assert max(actual) <= num_devices * micro_batch_size
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5])
+def test_invalid_parallel_microbatch_fails_before_sampling(invalid):
+    with pytest.raises(ValueError, match="positive integer"):
+        wave_sizes(12, 6, micro_batch_size=invalid)
+
+
+def test_six_gpu_throughput_preset_and_smoke_tail_use_distinct_stage1_batch_modes():
     repository = Path(__file__).resolve().parents[1]
     formal = load_run_config(repository / "configs/t2mem/t2mem_6gpu.yaml")
     smoke = load_run_config(repository / "configs/t2mem/t2mem_6gpu_smoke.yaml")
     assert formal.gpu_id == smoke.gpu_id == 1
     assert formal.num_devices == smoke.num_devices == 6
     assert formal.training.micro_batch_size == smoke.training.micro_batch_size == 1
-    assert formal.training.stage1_accumulation_steps == 64
-    assert formal.training.stage2_accumulation_steps == 32
+    assert formal.training.stage1_per_device_batch_size == 2
+    assert formal.training.stage1_accumulation_steps == 1
+    assert formal.per_device_batch("stage1") == 2
+    assert formal.effective_batch("stage1") == 12
+    assert formal.per_device_batch("stage2a") == formal.per_device_batch("stage2b") == 1
+    assert formal.training.stage2_accumulation_steps == 36
+    assert formal.effective_batch("stage2a") == formal.effective_batch("stage2b") == 36
     assert formal.training.stage1_updates == 20000
     assert formal.training.save_interval == smoke.training.save_interval == 5000
     assert formal.training.keep_last_checkpoints == smoke.training.keep_last_checkpoints == 2
-    assert formal.approximation_labels() == []
+    assert "truncated_observation_prefix" not in formal.approximation_labels()
+    assert "detached_fast_state" not in formal.approximation_labels()
+    assert smoke.training.stage1_per_device_batch_size is None
     assert smoke.training.stage1_accumulation_steps == smoke.training.stage2_accumulation_steps == 8
+    assert smoke.effective_batch("stage1") == smoke.effective_batch("stage2a") == 8
     assert smoke.training.stage1_updates == smoke.training.alternating_cycles == 1
     assert smoke.data.max_sequence_length == 32 and smoke.data.truncate_prefix
-    assert smoke.approximation_labels() == ["truncated_observation_prefix"]
+    assert "truncated_observation_prefix" in smoke.approximation_labels()
+
+
+@pytest.mark.parametrize("num_devices", [1, 6])
+def test_legacy_metadata_without_stage1_per_device_batch_keeps_64_and_32(num_devices):
+    saved = RunConfig(num_devices=num_devices).to_dict()
+    saved["training"].pop("stage1_per_device_batch_size", None)
+    restored = config_from_dict(saved)
+    assert restored.training.stage1_per_device_batch_size is None
+    assert restored.per_device_batch("stage1") == 1
+    assert restored.effective_batch("stage1") == 64
+    assert restored.effective_batch("stage2a") == restored.effective_batch("stage2b") == 32
+
+
+def test_new_stage1_accumulation_counts_per_device_waves_without_changing_stage2():
+    config = RunConfig(num_devices=6)
+    config.training.stage1_per_device_batch_size = 2
+    config.training.stage1_accumulation_steps = 3
+    config.validate()
+    assert config.per_device_batch("stage1") == 2
+    assert config.effective_batch("stage1") == 36
+    assert config.per_device_batch("stage2a") == 1
+    assert config.effective_batch("stage2a") == 32
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5])
+def test_stage1_per_device_batch_rejects_nonpositive_or_noninteger_values(invalid):
+    config = RunConfig(num_devices=6)
+    config.training.stage1_per_device_batch_size = invalid
+    with pytest.raises(ValueError, match="stage1_per_device_batch_size"):
+        config.validate()
 
 
 @pytest.fixture(scope="module")
@@ -100,6 +157,80 @@ def test_cli_defaults_preserve_loaded_configuration_and_later_explicit_flags_win
         "--num-devices", "2", "--gpu-id", "3", "--save-interval", "1000",
     ])
     assert args.num_devices == 2 and args.gpu_id == 3 and args.save_interval == 1000
+
+
+def test_stage1_throughput_and_benchmark_cli_flags_have_explicit_positive_values(cli_helpers):
+    parse = cli_helpers["parse_args"]
+    defaults = parse(["--stage", "stage1"])
+    assert defaults.stage1_per_device_batch is None
+    assert defaults.stage1_accumulation_steps is None
+    assert defaults.benchmark_steps is None
+    assert defaults.benchmark_warmup_steps == 2
+    args = parse([
+        "--stage", "stage1", "--stage1-per-device-batch", "4", "--stage1-accumulation-steps", "3",
+        "--benchmark-steps", "5", "--benchmark-warmup-steps", "2",
+    ])
+    assert args.stage1_per_device_batch == 4 and args.stage1_accumulation_steps == 3
+    assert args.benchmark_steps == 5 and args.benchmark_warmup_steps == 2
+
+
+def test_resume_explicitly_selects_stage1_throughput_without_resetting_saved_update_budget(cli_helpers):
+    args = cli_helpers["parse_args"]([
+        "--stage", "resume", "--resume", "runs/ckpts/saved_single_device/5000",
+        "--num-devices", "6", "--stage1-per-device-batch", "8", "--stage1-accumulation-steps", "1",
+    ])
+    assert args.stage1_per_device_batch == 8 and args.stage1_accumulation_steps == 1
+    assert args.num_devices == 6 and args.updates is None and args.cycles is None
+    assert args.benchmark_steps is None
+
+
+@pytest.mark.parametrize(
+    "flag", ["--stage1-per-device-batch", "--stage1-accumulation-steps", "--benchmark-steps", "--benchmark-warmup-steps"],
+)
+@pytest.mark.parametrize("invalid", ["0", "-1", "1.5"])
+def test_stage1_throughput_cli_rejects_invalid_counts_before_loading_a_model(cli_helpers, flag, invalid):
+    with pytest.raises(SystemExit) as error:
+        cli_helpers["parse_args"](["--stage", "stage1", flag, invalid])
+    assert error.value.code == 2
+
+
+@pytest.fixture(scope="module")
+def tuner_helpers():
+    script = Path(__file__).resolve().parents[1] / "scripts/t2mem/tune_stage1_batch.py"
+    return runpy.run_path(str(script))
+
+
+def test_stage1_tuner_selects_measured_throughput_instead_of_largest_batch(tuner_helpers):
+    reports = [
+        {"per_device_batch": 1, "samples_per_second": float("nan")},
+        {"per_device_batch": 2, "samples_per_second": 0.0},
+        {"per_device_batch": 4, "samples_per_second": 72.0},
+        {"per_device_batch": 8, "samples_per_second": 65.0},
+        {"per_device_batch": 16, "samples_per_second": float("inf")},
+    ]
+    selected = tuner_helpers["select_fastest"](reports)
+    assert selected is reports[2]
+    assert selected["per_device_batch"] == 4
+
+
+@pytest.mark.parametrize("rates", [[], [0.0, -1.0, float("nan"), float("inf")]])
+def test_stage1_tuner_refuses_a_config_without_successful_finite_measurements(tuner_helpers, rates):
+    reports = [{"per_device_batch": index + 1, "samples_per_second": rate} for index, rate in enumerate(rates)]
+    with pytest.raises(ValueError, match="No successful batch measurements"):
+        tuner_helpers["select_fastest"](reports)
+
+
+@pytest.mark.parametrize(
+    "log", ["RESOURCE_EXHAUSTED: HBM allocation", "CUDA_ERROR_OUT_OF_MEMORY", "failed to allocate 123 bytes",
+            "unable to allocate device memory", "GPU out of memory"],
+)
+def test_stage1_tuner_recognizes_actual_memory_capacity_failures(tuner_helpers, log):
+    assert tuner_helpers["is_memory_failure"](log)
+
+
+@pytest.mark.parametrize("log", ["FileNotFoundError: no training manifest", "undefined symbol in libcuda.so", "KeyboardInterrupt"])
+def test_stage1_tuner_does_not_mistake_setup_or_interrupt_failures_for_batch_capacity(tuner_helpers, log):
+    assert not tuner_helpers["is_memory_failure"](log)
 
 
 @pytest.mark.parametrize("invalid", ["0", "-1"])
@@ -205,6 +336,30 @@ def test_collation_preserves_independent_histories_and_masks_dummy_slots():
     assert samples[0].observation_mask.all()  # Collation must not mutate the sampler result.
 
 
+def test_stage1_microbatch_collation_masks_partial_device_without_mutating_real_frames():
+    samples = [_sample(1, marker) for marker in (0.7, 1.1, 2.3)]
+    for sample in samples:
+        sample.write_mask[:] = False
+    batch, real_counts = collate_parallel_wave(samples, 2, micro_batch_size=2)
+    np.testing.assert_array_equal(real_counts, [2, 1])
+    assert np.issubdtype(real_counts.dtype, np.integer)
+    expected = collate_sequences(samples)
+    for actual_leaf, expected_leaf in zip(jax.tree.leaves(batch), jax.tree.leaves(expected), strict=True):
+        assert actual_leaf.shape[:3] == (2, 1, 2)
+        for frame in range(3):
+            np.testing.assert_array_equal(actual_leaf[frame // 2, :, frame % 2], expected_leaf[:, frame])
+    for name in ("action_mask", "write_mask", "observation_mask"):
+        assert not batch[name][1, :, 1].any()
+    np.testing.assert_array_equal(
+        batch["observation"]["tokenized_prompt_mask"][1, :, 1],
+        batch["observation"]["tokenized_prompt_mask"][0, :, 0],
+    )
+    assert batch["observation_mask"].sum() == 3
+    assert not batch["write_mask"].any()
+    assert not batch["action_mask"][..., 8:].any()
+    assert all(sample.observation_mask.all() and sample.action_mask.any() for sample in samples)
+
+
 def test_pinned_partitionable_threefry_keeps_per_frame_keys_stable_under_padding():
     if not jax.config.jax_threefry_partitionable:
         pytest.skip("Prefix stability applies to the pinned JAX default, not the optional legacy RNG override")
@@ -235,6 +390,63 @@ def _episode_loss(params, all_state, rng, batch):
     count = jnp.sum(valid)
     loss = jnp.sum(residual**2) / jnp.maximum(count, 1)
     return loss, {"supervised_chunks": count}
+
+
+def _stage1_frame_loss(params, all_state, rng, batch):
+    """Normalize each frame by its own valid H/action axes before the local mean."""
+    del all_state, rng
+    mask = batch["action_mask"] & batch["observation_mask"][..., None, None]
+    counts = jnp.sum(mask, axis=(-2, -1))
+    labeled = counts > 0
+    predicted = jnp.where(mask, params["weight"], 0.0)
+    target = jnp.where(mask, batch["actions"], 0.0)
+    per_frame = jnp.sum((predicted - target)**2, axis=(-2, -1)) / jnp.maximum(counts, 1)
+    real = jnp.sum(labeled)
+    loss = jnp.sum(per_frame) / jnp.maximum(real, 1)
+    return loss, {"supervised_chunks": (real > 0).astype(jnp.float32)}
+
+
+def test_stage1_microbatch_tail_uses_real_frame_weights_and_per_frame_action_normalization():
+    mesh = _mesh(2)
+    targets = np.asarray([0.0, 10.0, -3.0, 4.0, 21.0, -7.0, 1.0], np.float32)
+    params = {"weight": jnp.asarray(0.25, jnp.float32)}
+    gradient = make_parallel_grad(_stage1_frame_loss, mesh, micro_batch_size=2)
+    accumulate = make_parallel_accumulator(mesh)
+    reduce = make_gradient_reducer(mesh)
+    running, offset = None, 0
+    sizes = wave_sizes(len(targets), 2, micro_batch_size=2)
+    assert sizes == (4, 3)
+    for count in sizes:
+        samples = [_sample(1, float(target)) for target in targets[offset:offset + count]]
+        for index, sample in enumerate(samples):
+            sample.actions[:] = targets[offset + index]
+            sample.write_mask[:] = False
+            # Different real frames have 16, 8 or 4 supervised action elements.
+            sample.action_mask[:] = False
+            sample.action_mask[0, :2 if (offset + index) % 3 == 0 else 1,
+                               :4 if (offset + index) % 3 == 2 else 8] = True
+        batch, real_counts = collate_parallel_wave(samples, 2, micro_batch_size=2)
+        if count == 3:
+            np.testing.assert_array_equal(real_counts, [2, 1])
+            # A copied dummy target must never affect the local mean or gradient.
+            batch["actions"][1, :, 1] = 1e6
+        rngs = jnp.stack([jax.random.PRNGKey(offset + device) for device in range(2)])
+        (loss, stats), grads = gradient(params, {}, rngs, batch, real_counts)
+        wave = {"loss": loss, "stats": stats, "gradients": grads}
+        running = wave if running is None else accumulate(running, wave)
+        offset += count
+    actual = reduce(running, len(targets))
+    expected_gradient = 2 * (0.25 - targets.mean())
+    expected_loss = np.mean((0.25 - targets)**2)
+    np.testing.assert_allclose(jax.device_get(actual["gradients"]["weight"]), expected_gradient,
+                               rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(jax.device_get(actual["loss"]), expected_loss, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(jax.device_get(actual["stats"]["supervised_chunks"]), 1.0, rtol=0, atol=0)
+    assert offset == len(targets)
+    # Means of device means would give the single-frame last device two votes.
+    incorrect_mean = (2 * (0.25 - targets[:2].mean()) + 2 * (0.25 - targets[2:4].mean())
+                      + 2 * (0.25 - targets[4:6].mean()) + 2 * (0.25 - targets[6])) / 4
+    assert not np.isclose(expected_gradient, incorrect_mean)
 
 
 @pytest.mark.parametrize("num_devices", [2, 6])
@@ -425,6 +637,39 @@ class TinyParallelModel(nnx.Module):
                       "scheduled_writes": jnp.sum(write_mask & observation_mask) * memory_enabled}
 
 
+class TinyStage1BatchedModel(TinyParallelModel):
+    """One-frame objective with stochastic targets that survive regrouping.
+
+    Frame-keyed noise keeps the same frame's objective identical in a serial
+    batch and smaller device batches. Trainer PRNG consumption is checked
+    separately, because throughput mode deliberately changes microbatch keys.
+    """
+
+    def compute_sequence_loss(self, rng, observation, actions, action_mask, write_mask, observation_mask,
+                              *, train, memory_enabled):
+        del rng, train
+        assert not memory_enabled
+        assert actions.shape[0] == 1
+        feature = observation.state[..., 0]
+        frame_ids = (jnp.abs(feature[0]) * 100_000).astype(jnp.uint32)
+        frame_keys = jax.vmap(jax.random.PRNGKey)(frame_ids)
+        noise = jax.vmap(lambda key: jax.random.uniform(key, (), dtype=jnp.float32))(frame_keys)[None]
+        layer = self.PaliGemma.llm.layers
+        expert = layer.expert_1.value
+        prediction = (expert[0] + expert[1] * feature + expert[2] * feature**2
+                      + layer.lora.value * noise + self.action_out_proj.kernel.value * feature**3
+                      + layer.base.value + self.PaliGemma.img.kernel.value + self.auxiliary.value[0])
+        mask = action_mask & observation_mask[..., None, None]
+        counts = jnp.sum(mask, axis=(-2, -1))
+        residual = (jnp.where(mask, prediction[..., None, None], 0.0)
+                    - jnp.where(mask, actions, 0.0))
+        per_frame = jnp.sum(residual**2, axis=(-2, -1)) / jnp.maximum(counts, 1)
+        supervised = jnp.sum(counts > 0)
+        loss = jnp.sum(per_frame) / jnp.maximum(supervised, 1)
+        return loss, {"action_loss": loss, "supervised_chunks": supervised,
+                      "scheduled_writes": jnp.sum(write_mask & observation_mask)}
+
+
 class SyntheticSampler:
     """Host RNG and counters expose dummy-slot consumption or ordering errors."""
 
@@ -456,6 +701,93 @@ class SyntheticSampler:
         self.rng.bit_generator.state = copy.deepcopy(state["rng"])
         self.task_updates = Counter(state["task_updates"])
         self.task_samples = Counter(state["task_samples"])
+
+
+class Stage1FrameSampler(SyntheticSampler):
+    """Random real frames with unequal valid action horizons and no writes."""
+
+    def sample(self, task, *, stage1):
+        assert stage1
+        sample = super().sample(task, stage1=True)
+        index = int(sample.episode)
+        sample.action_mask[:] = False
+        sample.action_mask[0, :2 if index % 3 == 0 else 1, :4 if index % 3 == 2 else 8] = True
+        return sample
+
+
+def _stage1_batched_trainer(tmp_path, num_devices, per_device_batch, accumulation=2):
+    config = RunConfig(num_devices=num_devices,
+                       checkpoint_dir=str(tmp_path / f"stage1_batch_{num_devices}_{per_device_batch}"))
+    config.training.stage1_per_device_batch_size = per_device_batch
+    config.training.stage1_accumulation_steps = accumulation
+    config.training.stage1_updates = 2
+    config.training.save_interval = 5000
+    config.training.outer_gradient_clip = 1.0
+    assets = tmp_path / "stage1_batch_assets"
+    assets.mkdir(exist_ok=True)
+    (assets / "norm_stats.json").write_text("{}")
+    config.data.norm_stats_dir = str(assets)
+    config.validate()
+    return Trainer(TinyStage1BatchedModel(), config, PhaseProgress.start("stage1"), Stage1FrameSampler())
+
+
+@pytest.mark.parametrize("num_devices", [2, 6])
+def test_stage1_batched_device_updates_match_same_global_serial_batch_and_restore(tmp_path, num_devices):
+    _mesh(num_devices)
+    accumulation, per_device_batch = 2, 2
+    serial = _stage1_batched_trainer(tmp_path, 1, num_devices * per_device_batch, accumulation)
+    parallel = _stage1_batched_trainer(tmp_path, num_devices, per_device_batch, accumulation)
+    global_batch = num_devices * per_device_batch * accumulation
+    assert serial.config.effective_batch("stage1") == parallel.config.effective_batch("stage1") == global_batch
+    shapes = [leaf.shape for leaf in jax.tree.leaves(serial.state)]
+    expected_serial_rng, expected_parallel_rng = serial.rng, parallel.rng
+    restored = None
+    for update in (1, 2):
+        expected = serial.step()
+        actual = parallel.step()
+        for _ in range(accumulation):
+            expected_serial_rng, _ = jax.random.split(expected_serial_rng)
+        for _ in range(num_devices * accumulation):
+            expected_parallel_rng, _ = jax.random.split(expected_parallel_rng)
+        for name in ("step", "stage", "effective_batch", "parallel_waves", "sequence_length_max",
+                     "supervised_frames", "scheduled_memory_writes", "task_updates", "task_samples"):
+            assert actual[name] == expected[name]
+        for name in ("loss", "gradient_norm", "action_loss", "supervised_chunks", "scheduled_writes"):
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-5, atol=1e-6)
+        assert actual["per_device_batch_size"] == 2
+        assert expected["per_device_batch_size"] == num_devices * 2
+        assert actual["parallel_waves"] == accumulation
+        assert actual["supervised_frames"] == global_batch
+        assert actual["supervised_chunks"] == 1.0
+        assert actual["scheduled_memory_writes"] == actual["scheduled_writes"] == 0
+        assert actual["gradient_norm"] > 1.0  # Exercises clipping after the global mean.
+        assert actual["task_samples"] == {"PickXtimes": global_batch * update}
+        assert np.isfinite(actual["step_seconds"]) and actual["step_seconds"] > 0
+        assert np.isfinite(actual["samples_per_second"]) and actual["samples_per_second"] > 0
+        np.testing.assert_array_equal(jax.device_get(serial.rng), jax.device_get(expected_serial_rng))
+        np.testing.assert_array_equal(jax.device_get(parallel.rng), jax.device_get(expected_parallel_rng))
+        assert parallel.sampler.state_dict() == serial.sampler.state_dict()
+        _tree_allclose(serial.state, parallel.state)
+        _tree_allclose(serial.optimizer_states, parallel.optimizer_states)
+        assert [leaf.shape for leaf in jax.tree.leaves(parallel.state)] == shapes
+        if update == 1:
+            checkpoint = parallel.save()
+            restored = _stage1_batched_trainer(tmp_path, num_devices, per_device_batch, accumulation)
+            restored.restore(checkpoint)
+            _tree_allclose(parallel.state, restored.state, rtol=0, atol=0)
+            _tree_allclose(parallel.optimizer_states, restored.optimizer_states, rtol=0, atol=0)
+            np.testing.assert_array_equal(jax.device_get(parallel.rng), jax.device_get(restored.rng))
+            assert restored.sampler.state_dict() == parallel.sampler.state_dict()
+        else:
+            resumed = restored.step()
+            np.testing.assert_allclose(resumed["loss"], actual["loss"], rtol=1e-5, atol=1e-6)
+            _tree_allclose(parallel.state, restored.state)
+            _tree_allclose(parallel.optimizer_states, restored.optimizer_states)
+            np.testing.assert_array_equal(jax.device_get(parallel.rng), jax.device_get(restored.rng))
+            assert restored.sampler.state_dict() == parallel.sampler.state_dict()
+            assert asdict(restored.progress) == asdict(parallel.progress)
+    assert parallel.progress.complete
+    assert set(parallel.optimizer_states) == {"stage1"}
 
 
 def _trainer(tmp_path, num_devices, mode, global_batch):
