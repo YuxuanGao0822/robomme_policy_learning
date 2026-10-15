@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wait for an existing Stage-1 job, then queue Stage 2 and matched A/B/C evaluations.
+"""Wait for Stage 1 and an optional GPU occupant, then run Stage 2 and A/B/C evaluations.
 
 The supervisor uses only Python's standard library. Model code runs exclusively
 in child processes on the Linux server; importing this file starts no jobs.
@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import signal
@@ -26,6 +27,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger("t2mem.pipeline")
+WAITING_STAGES = ("WAIT_STAGE1", "WAIT_GPUS", "WAIT_RESOURCE_PROCESS")
 
 
 class PipelineCancelled(RuntimeError):
@@ -47,6 +49,13 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _positive_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return value
+
+
 def _device_list(text: str) -> tuple[int, ...]:
     try:
         values = tuple(int(part.strip()) for part in text.split(","))
@@ -60,11 +69,22 @@ def _device_list(text: str) -> tuple[int, ...]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-pid", type=_positive_int, default=1776511)
-    parser.add_argument("--poll-interval", type=_positive_int, default=600)
+    parser.add_argument("--wait-pid", type=_positive_int,
+                        help="Wait read-only for this GPU occupant to exit, including another account's process")
+    parser.add_argument("--poll-interval", type=_positive_int, default=600,
+                        help="Seconds between unchanged waiting-state log messages (not GPU checks)")
+    parser.add_argument("--check-interval", type=_positive_float, default=2.0,
+                        help="Seconds between checks of watched processes and queued GPUs")
+    parser.add_argument("--gpu-policy", choices=("exclusive", "memory"), default="exclusive",
+                        help="exclusive rejects existing compute processes; memory allows sharing if enough memory is free")
+    parser.add_argument("--min-free-mib", type=_positive_int, default=60000,
+                        help="Minimum free MiB on every requested GPU under --gpu-policy memory")
     parser.add_argument("--stage1-root", type=Path, default=Path("runs/ckpts/pickxtimes_stage1_6gpu"))
     parser.add_argument("--stage1-steps", type=_positive_int, default=20000)
     parser.add_argument("--stage2-root", type=Path, default=Path("runs/ckpts/pickxtimes_t2mem_6gpu"))
     parser.add_argument("--pipeline-dir", type=Path, default=Path("runs/pipeline/pickxtimes_6gpu"))
+    parser.add_argument("--replace-waiter", action="store_true",
+                        help="Stop this account's existing waiting driver before restarting; refuse active workers")
     parser.add_argument("--cycles", type=_positive_int, default=4)
     parser.add_argument("--devices", type=_device_list, default=(1, 2, 3, 4, 5, 6))
     parser.add_argument("--policy-gpu", type=int, default=6)
@@ -311,6 +331,79 @@ def gpu_is_idle(devices: tuple[int, ...], runner=subprocess.run) -> bool:
     return True
 
 
+def gpu_availability(devices: tuple[int, ...], policy: str, min_free_mib: int,
+                     runner=subprocess.run) -> tuple[bool, dict]:
+    """Probe admission capacity without claiming a hardware reservation.
+
+    The memory policy explicitly permits sharing GPUs with existing compute
+    processes. Free-memory checks are admission estimates, not a guarantee of
+    peak training capacity or protection against another user's allocations.
+    Missing or unreadable probe data always prevents admission.
+    """
+    if policy not in ("exclusive", "memory"):
+        raise ValueError(f"Unknown GPU policy: {policy}")
+    if type(min_free_mib) is not int or min_free_mib <= 0:
+        raise ValueError("min_free_mib must be a positive integer")
+    records = [{"index": device, "uuid": None, "free_mib": None,
+                "utilization_percent": None, "compute_pids": [], "blocked": True,
+                "block_reasons": []} for device in devices]
+    details = {"policy": policy, "min_free_mib": min_free_mib if policy == "memory" else None,
+               "gpus": records, "probe_error": None}
+    try:
+        result = runner(["nvidia-smi", "--query-gpu=index,uuid,memory.free,utilization.gpu",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, check=True, timeout=30)
+        inventory = {}
+        selected = set(devices)
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            index_text, uuid, free_text, utilization_text = (value.strip() for value in line.split(","))
+            index = int(index_text)
+            if index not in selected:
+                continue
+            free, utilization = int(free_text), int(utilization_text)
+            if not uuid or uuid == "N/A" or free < 0 or not 0 <= utilization <= 100 or index in inventory:
+                raise ValueError(f"Invalid GPU probe row: {line}")
+            inventory[index] = (uuid, free, utilization)
+        processes = runner(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+                           capture_output=True, text=True, check=True, timeout=30)
+        pids = collections.defaultdict(set)
+        selected_uuids = {values[0] for values in inventory.values()}
+        for line in processes.stdout.splitlines():
+            if not line.strip() or line.strip() == "No running processes found":
+                continue
+            uuid, pid_text = (value.strip() for value in line.split(","))
+            if not uuid or uuid == "N/A":
+                raise ValueError(f"Invalid compute-process probe row: {line}")
+            if uuid not in selected_uuids:
+                continue
+            pid = int(pid_text)
+            if pid <= 0:
+                raise ValueError(f"Invalid compute-process probe row: {line}")
+            pids[uuid].add(pid)
+        for record in records:
+            values = inventory.get(record["index"])
+            if values is None:
+                record["block_reasons"].append("gpu_missing_from_probe")
+                continue
+            uuid, free, utilization = values
+            record.update(uuid=uuid, free_mib=free, utilization_percent=utilization,
+                          compute_pids=sorted(pids[uuid]))
+            if policy == "exclusive" and record["compute_pids"]:
+                record["block_reasons"].append("compute_processes_present")
+            if policy == "memory" and free < min_free_mib:
+                record["block_reasons"].append("free_memory_below_threshold")
+            record["blocked"] = bool(record["block_reasons"])
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        details["probe_error"] = f"{type(error).__name__}: {error}"
+        for record in records:
+            record["blocked"] = True
+            record["block_reasons"] = ["gpu_probe_failed"]
+        return False, details
+    return bool(records) and not any(record["blocked"] for record in records), details
+
+
 class FileLock:
     """A cooperative same-user lock; it does not reserve hardware from other users."""
     def __init__(self, path: Path):
@@ -334,6 +427,116 @@ class FileLock:
             self.file = None
 
 
+def _process_holds_pipeline_lock(pid: int, lock_path: Path) -> bool:
+    """Prove that this Linux process holds the target file's exclusive flock."""
+    try:
+        stat = lock_path.stat()
+        expected = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
+        entries = list(Path(f"/proc/{pid}/fdinfo").iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            lines = entry.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 9 or fields[0] != "lock:" or fields[2:5] != ["FLOCK", "ADVISORY", "WRITE"]:
+                continue
+            try:
+                major, minor, inode = fields[6].split(":")
+                actual = (int(major, 16), int(minor, 16), int(inode))
+                owner = int(fields[5])
+            except ValueError:
+                continue
+            if owner == pid and actual == expected:
+                return True
+    return False
+
+
+def replace_waiting_driver(directory: Path, timeout: float = 40) -> None:
+    """Freeze and verify the exact waiting lock owner before requesting its exit.
+
+    A pidfd prevents signalling a reused PID. Freezing the driver closes the
+    gap between checking WAIT_* and its next worker launch. The existing
+    pipeline only enters WAIT_* after its owned workers have been stopped.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Replacement timeout must be finite and positive")
+    directory = (ROOT / directory.expanduser()).resolve()
+    lock = FileLock(directory / "pipeline.lock")
+    if lock.acquire():
+        lock.release()
+        return
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        raise RuntimeError("Safe replacement requires Linux pidfd support; no signal was sent")
+    state = json.loads((directory / "state.json").read_text())
+    if state.get("status") != "RUNNING" or state.get("stage") not in WAITING_STAGES:
+        raise RuntimeError("The existing pipeline is not waiting; refusing to interrupt active work")
+    pid = state.get("driver_pid")
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
+        raise RuntimeError("Invalid existing pipeline driver PID")
+    identity = read_process_identity(pid)
+    if identity is None or identity.get("uid") != os.getuid():
+        raise RuntimeError("Cannot verify the existing driver belongs to this account")
+    if identity.get("state") in ("T", "t"):
+        raise RuntimeError("The existing driver was already stopped; refusing to change its signal state")
+    command = Path(f"/proc/{pid}/cmdline").read_bytes()
+    if not any(argument == b"scripts/t2mem/run_pipeline.py"
+               or argument.endswith(b"/scripts/t2mem/run_pipeline.py") for argument in command.split(b"\0")):
+        raise RuntimeError("The recorded PID is not the pipeline driver; no signal was sent")
+    if not _process_holds_pipeline_lock(pid, lock.path):
+        raise RuntimeError("Cannot verify that the recorded driver owns this pipeline lock; no signal was sent")
+    pidfd = pidfd_open(pid, 0)
+    stop_requested = False
+    try:
+        if not same_process(identity, read_process_identity(pid)):
+            raise RuntimeError("The existing driver identity changed; no signal was sent")
+        stop_requested = True
+        pidfd_send_signal(pidfd, signal.SIGSTOP, None, 0)
+        stopped_deadline = time.monotonic() + timeout
+        while True:
+            observed = read_process_identity(pid)
+            if not same_process(identity, observed):
+                raise RuntimeError("The existing driver exited while preparing replacement")
+            if observed["state"] in ("T", "t"):
+                break
+            if time.monotonic() >= stopped_deadline:
+                raise TimeoutError("The old driver did not stop; replacement was refused")
+            time.sleep(0.05)
+        refreshed = json.loads((directory / "state.json").read_text())
+        if (refreshed.get("status") != "RUNNING" or refreshed.get("driver_pid") != pid
+                or refreshed.get("stage") not in WAITING_STAGES
+                or not same_process(identity, read_process_identity(pid))
+                or not _process_holds_pipeline_lock(pid, lock.path)):
+            raise RuntimeError("The existing driver is no longer a verified waiting lock owner; refusing replacement")
+        LOGGER.info("Stopping verified waiting pipeline driver %s before replacement", pid)
+        pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+    finally:
+        try:
+            if stop_requested:
+                # Always release our stop, including refusal after a phase
+                # transition and exceptions while examining the frozen driver.
+                with contextlib.suppress(ProcessLookupError):
+                    pidfd_send_signal(pidfd, signal.SIGCONT, None, 0)
+        finally:
+            os.close(pidfd)
+    deadline = time.monotonic() + timeout
+    while True:
+        # The old run releases pipeline.lock before its Stage-2 lock. Requiring
+        # process exit as well ensures both are released before replacement.
+        ended = not same_process(identity, read_process_identity(pid))
+        if ended and lock.acquire():
+            lock.release()
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("The previous driver has not exited and released its lock; no new pipeline was started")
+        time.sleep(0.2)
+
+
 class Pipeline:
     def __init__(self, options: argparse.Namespace):
         self.options = options
@@ -355,16 +558,30 @@ class Pipeline:
             data = json.loads(previous.read_text())
             if data.get("watched_process", {}).get("pid") == options.watch_pid:
                 self.state["watched_process"] = data["watched_process"]
+            resource = data.get("resource_process")
+            if isinstance(resource, dict) and resource.get("pid") == options.wait_pid:
+                self.state["resource_process"] = resource
         self.gpu_locks: list[FileLock] = []
+        self._wait_log_key = None
+        self._wait_log_at: float | None = None
 
     def update(self, stage: str, **values) -> None:
         self.state.update(stage=stage, updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), **values)
         atomic_json(self.directory / "state.json", self.state)
         LOGGER.info("%s %s", stage, json.dumps(values, ensure_ascii=False))
 
+    def _update_wait(self, stage: str, *, wait_key, **values) -> None:
+        """Keep admission checks responsive while throttling unchanged wait logs."""
+        now = time.monotonic()
+        key = (stage, wait_key)
+        if (key != self._wait_log_key or self._wait_log_at is None
+                or now - self._wait_log_at >= self.options.poll_interval):
+            self.update(stage, **values)
+            self._wait_log_key, self._wait_log_at = key, now
+
     def _pause(self, seconds: float) -> None:
         if self.cancelled.wait(seconds):
-            raise PipelineCancelled("Pipeline stopped by signal; the existing Stage-1 job was left running")
+            raise PipelineCancelled("Pipeline stopped by signal; monitored external processes were left running")
 
     def preflight(self) -> None:
         if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
@@ -380,6 +597,7 @@ class Pipeline:
             raise ValueError(f"Requested GPUs not present: {self.options.devices}; found {inventory}")
 
     def wait_for_training(self) -> Path:
+        self._wait_log_key, self._wait_log_at = None, None
         final = self.options.stage1_root / str(self.options.stage1_steps)
         observed = read_process_identity(self.options.watch_pid)
         expected = self.state.get("watched_process")
@@ -402,9 +620,11 @@ class Pipeline:
                 observed = current
                 self.state["watched_process"] = expected
         while expected is not None and same_process(expected, observed):
-            self.update("WAIT_STAGE1", watched_process=expected, last_process_state=observed["state"],
-                        expected_checkpoint=str(final))
-            self._pause(self.options.poll_interval)
+            self._update_wait("WAIT_STAGE1", wait_key=(expected["pid"], expected["start_time"]),
+                              watched_process=expected, last_process_state=observed["state"],
+                              expected_checkpoint=str(final), check_interval=self.options.check_interval,
+                              waiting_log_interval=self.options.poll_interval)
+            self._pause(self.options.check_interval)
             observed = read_process_identity(self.options.watch_pid)
         metadata = validate_checkpoint(final, "stage1", self.options.stage1_steps)
         # Training completion is proved by committed final weights, not disappearance of a PID.
@@ -412,6 +632,31 @@ class Pipeline:
             raise ValueError("Stage-1 saved budget differs from the selected final step")
         self.update("STAGE1_COMPLETE", stage1_checkpoint=str(final))
         return final
+
+    def wait_for_resource_process(self) -> None:
+        """Observe one GPU occupant without requiring ownership or signalling it.
+
+        A saved PID/start-time/UID identity binds the wait to the original job.
+        The GPU admission check still runs afterwards: an exited PID does not
+        prove that every requested GPU is available.
+        """
+        pid = self.options.wait_pid
+        if pid is None:
+            return
+        self._wait_log_key, self._wait_log_at = None, None
+        observed = read_process_identity(pid)
+        expected = self.state.get("resource_process")
+        if expected is None and observed is not None and observed.get("state") not in ("Z", "X"):
+            expected = observed
+            self.state["resource_process"] = expected
+        while expected is not None and same_process(expected, observed):
+            self._update_wait("WAIT_RESOURCE_PROCESS", wait_key=(pid, expected["start_time"], expected["uid"]),
+                              resource_process=expected, last_process_state=observed["state"],
+                              devices=list(self.options.devices), check_interval=self.options.check_interval,
+                              waiting_log_interval=self.options.poll_interval)
+            self._pause(self.options.check_interval)
+            observed = read_process_identity(pid)
+        self.update("RESOURCE_PROCESS_COMPLETE", waited_pid=pid, devices=list(self.options.devices))
 
     def _gpu_env(self, devices: tuple[int, ...], *, simulator: bool = False,
                  memory_fraction: str = "0.90") -> dict[str, str]:
@@ -424,6 +669,7 @@ class Pipeline:
 
     def wait_for_gpus(self, devices: tuple[int, ...], stage: str) -> None:
         self.release_gpus()
+        self._wait_log_key, self._wait_log_at = None, None
         inventory = gpu_inventory()
         while True:
             if self.cancelled.is_set():
@@ -431,21 +677,31 @@ class Pipeline:
             locks = [FileLock(Path.home() / ".cache/t2mem/gpu_locks" / f"{inventory[device]}.lock")
                      for device in sorted(set(devices))]
             acquired = []
+            blocked_locks = []
             for lock in locks:
                 if not lock.acquire():
+                    blocked_locks.append(str(lock.path))
                     break
                 acquired.append(lock)
             try:
-                if len(acquired) == len(locks) and gpu_is_idle(devices):
+                available, details = gpu_availability(devices, self.options.gpu_policy, self.options.min_free_mib)
+                if len(acquired) == len(locks) and available:
                     self.gpu_locks = acquired
-                    self.update(stage, devices=list(devices))
+                    self.update(stage, devices=list(devices), gpu_availability=details)
                     return
             finally:
                 if self.gpu_locks != acquired:
                     for lock in acquired:
                         lock.release()
-            self.update("WAIT_GPUS", next_stage=stage, devices=list(devices))
-            self._pause(self.options.poll_interval)
+            reasons = tuple((record.get("index"), tuple(record.get("block_reasons", ())),
+                             tuple(record.get("compute_pids", ()))) for record in details.get("gpus", ()))
+            self._update_wait("WAIT_GPUS", wait_key=(stage, devices, reasons, details.get("probe_error"),
+                                                     tuple(blocked_locks)),
+                              next_stage=stage, devices=list(devices), gpu_availability=details,
+                              blocked_cooperative_locks=blocked_locks,
+                              check_interval=self.options.check_interval,
+                              waiting_log_interval=self.options.poll_interval)
+            self._pause(self.options.check_interval)
 
     def release_gpus(self) -> None:
         for lock in self.gpu_locks:
@@ -679,6 +935,7 @@ class Pipeline:
             (self.directory / "driver.pid").write_text(f"{os.getpid()}\n")
             self.preflight()
             stage1 = self.wait_for_training()
+            self.wait_for_resource_process()
             stage2 = self.train_stage2(stage1)
             results = {"A": self.evaluate("A", stage1, "memory-free"),
                        "B": self.evaluate("B", stage2, "full"),
@@ -701,6 +958,25 @@ class Pipeline:
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     options = parse_args(argv)
+    if options.replace_waiter:
+        def cancel_replacement(*_):
+            # Unwind the replacement's finally block so a temporarily frozen
+            # old driver is resumed if the new launcher is stopped normally.
+            raise PipelineCancelled("Pipeline replacement cancelled by signal")
+
+        previous_handlers = {signum: signal.signal(signum, cancel_replacement)
+                             for signum in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            replace_waiting_driver(options.pipeline_dir)
+        except PipelineCancelled:
+            LOGGER.info("Pipeline replacement cancelled")
+            raise SystemExit(130)
+        except Exception:
+            LOGGER.exception("Could not safely replace the waiting driver")
+            raise SystemExit(1)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     pipeline = Pipeline(options)
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: pipeline.cancelled.set())
