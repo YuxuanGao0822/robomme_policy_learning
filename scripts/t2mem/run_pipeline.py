@@ -69,6 +69,8 @@ def _device_list(text: str) -> tuple[int, ...]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--watch-pid", type=_positive_int, default=1776511)
+    parser.add_argument("--stage1-ready", action="store_true",
+                        help="Validate the completed Stage-1 checkpoint directly, without waiting for its old PID")
     parser.add_argument("--wait-pid", type=_positive_int,
                         help="Wait read-only for this GPU occupant to exit, including another account's process")
     parser.add_argument("--poll-interval", type=_positive_int, default=600,
@@ -599,8 +601,8 @@ class Pipeline:
     def wait_for_training(self) -> Path:
         self._wait_log_key, self._wait_log_at = None, None
         final = self.options.stage1_root / str(self.options.stage1_steps)
-        observed = read_process_identity(self.options.watch_pid)
-        expected = self.state.get("watched_process")
+        observed = None if self.options.stage1_ready else read_process_identity(self.options.watch_pid)
+        expected = None if self.options.stage1_ready else self.state.get("watched_process")
         if expected is None and observed is not None and observed.get("state") not in ("Z", "X"):
             if observed["uid"] != os.getuid():
                 raise ValueError(f"Watched PID {self.options.watch_pid} belongs to another account")

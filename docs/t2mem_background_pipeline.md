@@ -71,9 +71,11 @@ tail -n 80 -f runs/logs/pickxtimes_pipeline_gpu0_5.log
 
 初次等待时保存PID、启动时间和UID，使用相同流水线目录重启时继续等待同一进程，避免误等后来复用同一PID的新任务。`WAIT_RESOURCE_PROCESS`表示仍在等指定进程；`RESOURCE_PROCESS_COMPLETE`表示原进程结束；随后出现`TRAIN_STAGE2`表示六卡准入检查通过。10秒是检查间隔，不能阻止其他用户在空档启动新任务。
 
-## 已完成A、GPU1–5已被占用时
+## 直接使用GPU6继续训练和评测
 
 可以显式改用物理GPU6继续B和A/B/C评测，沿用完整A快照，无需重新训练Stage1。Stage2仍使用A保存配置中的全局batch32，在单卡上通过累积完成，因此吞吐会降低。
+
+专用入口`run_gpu6_pipeline.sh`固定训练、policy和simulator都使用GPU6，并使用`--stage1-ready`直接核验`runs/ckpts/pickxtimes_stage1_6gpu/20000`，跳过对原Stage1旧PID的检查。它不等待之前GPU0–5上的`2033835`。GPU6只有gdm/Xorg等graphics进程时可以按排他compute策略直接启动。
 
 以下命令的`--replace-waiter`仅用于替换同一流水线目录中的旧等待驱动：核实本账号和目标文件锁，短暂停住驱动后再次确认它处于等待状态，再令其退出并等待清理完成。若驱动已进入训练或评测，则拒绝替换并让原驱动继续运行。它不停止原Stage1进程或其他用户的进程。
 
@@ -86,12 +88,7 @@ git pull
 uv run --no-sync python tests/test_t2mem_pipeline.py
 mkdir -p runs/logs
 
-nohup bash scripts/t2mem/run_pipeline.sh \
-  --replace-waiter \
-  --watch-pid 1776511 \
-  --devices 6 --policy-gpu 6 --sim-gpu 6 \
-  --gpu-policy memory --min-free-mib 70000 \
-  --check-interval 2 --poll-interval 600 --cycles 4 \
+nohup bash scripts/t2mem/run_gpu6_pipeline.sh \
   > runs/logs/pickxtimes_pipeline_gpu6.log 2>&1 &
 
 printf '启动PID=%s\n' "$!"
@@ -99,7 +96,7 @@ printf '启动PID=%s\n' "$!"
 tail -n 80 -f runs/logs/pickxtimes_pipeline_gpu6.log
 ```
 
-这里按日志中GPU6约71,533MiB可用显存设置70,000MiB启动阈值。它不是最长完整历史训练的显存峰值保证；实际峰值仍需在服务器验证，共享进程后续也可能继续分配显存。GPU6不足时此命令继续排队，不会自动扩大到未经指定的GPU。
+沿用原Stage2输出目录；存在完整、可恢复的Stage2快照时自动续训，存在已完成的最终快照时直接进入评测。非空但没有可恢复快照的失败目录仍会明确报错并保留原文件。日志中的`CUDA_VISIBLE_DEVICES=6`和`num_devices=1`用于核实实际设备，历史目录名中的`6gpu`不决定本次使用卡数。
 
 ## 日志与结果
 

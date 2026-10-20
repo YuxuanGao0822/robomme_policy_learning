@@ -823,6 +823,40 @@ class PipelineSupervisorTests(unittest.TestCase):
         pause.assert_called_once_with(2.0)
         self.assertEqual(self.driver.state["stage"], "STAGE1_COMPLETE")
 
+    def test_completed_stage1_mode_ignores_old_pid_even_with_saved_process_identity(self):
+        a = checkpoint(self.root / "a")
+        self.driver.options.stage1_ready = True
+        self.driver.state["watched_process"] = {
+            "pid": 1776511, "start_time": "old", "uid": pipeline.os.getuid(), "state": "R",
+        }
+        with mock.patch.object(pipeline, "read_process_identity", side_effect=PermissionError("reused PID")) as probe, \
+                mock.patch.object(self.driver, "_pause") as pause:
+            self.assertEqual(self.driver.wait_for_training(), a)
+        probe.assert_not_called()
+        pause.assert_not_called()
+        self.assertEqual(self.driver.state["stage"], "STAGE1_COMPLETE")
+
+    def test_completed_stage1_mode_still_rejects_missing_incomplete_or_wrong_budget_snapshot(self):
+        self.driver.options.stage1_ready = True
+        with mock.patch.object(pipeline, "read_process_identity") as probe:
+            with self.assertRaises(ValueError):
+                self.driver.wait_for_training()
+            a = checkpoint(self.root / "a")
+            original = json.loads((a / "metadata.json").read_text())
+            for change in ("incomplete", "wrong_budget", "uncommitted"):
+                with self.subTest(change=change):
+                    metadata = copy.deepcopy(original)
+                    if change == "incomplete":
+                        metadata["progress"]["complete"] = False
+                    elif change == "wrong_budget":
+                        metadata["config"]["training"]["stage1_updates"] = 10000
+                    else:
+                        metadata["complete"] = False
+                    write_json(a / "metadata.json", metadata)
+                    with self.assertRaises(ValueError):
+                        self.driver.wait_for_training()
+        probe.assert_not_called()
+
     def test_watch_checks_frequently_without_repeating_ten_minute_wait_log(self):
         a = checkpoint(self.root / "a")
         identity = {"pid": 1776511, "start_time": "123", "uid": 1002, "state": "R"}
